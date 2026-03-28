@@ -137,7 +137,7 @@ get_ns_for_domain() {
     local domain="$1"
     local zone="$domain"
     while [[ "$zone" == *.* ]]; do
-        ns=$(dig +short NS "$zone" 2>/dev/null | head -1)
+        ns=$(dig +short NS "$zone" 2>/dev/null | head -1 || true)
         if [[ -n "$ns" ]]; then
             echo "$ns"
             return
@@ -191,9 +191,9 @@ verify_dns() {
 
     while [[ $attempts -lt $max_attempts ]]; do
         if [[ -n "$ns" ]]; then
-            resolved=$(dig +short A "$PUBLIC_HOSTNAME" "@${ns}" 2>/dev/null | head -1)
+            resolved=$(dig +short A "$PUBLIC_HOSTNAME" "@${ns}" 2>/dev/null | head -1 || true)
         else
-            resolved=$(dig +short A "$PUBLIC_HOSTNAME" 2>/dev/null | head -1)
+            resolved=$(dig +short A "$PUBLIC_HOSTNAME" 2>/dev/null | head -1 || true)
         fi
 
         if [[ -n "$resolved" ]]; then
