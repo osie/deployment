@@ -1,0 +1,27 @@
+include:
+  - docker-compose.base.yml
+
+services:
+  caddy:
+    image: caddy:alpine
+    container_name: osie-caddy
+    restart: unless-stopped
+    environment:
+      CADDY_DOMAIN: ${CADDY_DOMAIN:?CADDY_DOMAIN must be set}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - osie-network
+    depends_on:
+      - osie-ui
+      - osie-admin
+      - osie-api
+
+volumes:
+  caddy_data:
+  caddy_config:

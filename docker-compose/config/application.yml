@@ -1,0 +1,40 @@
+# OSIE API Configuration
+# MongoDB and RabbitMQ configuration is provided via environment variables
+
+logging:
+  level:
+    io.osie: DEBUG
+    org.springframework.security: DEBUG
+
+server:
+  port: 8080
+
+management:
+  server:
+    port: 8081
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+
+spring:
+  application:
+    name: osie-api
+  data:
+    mongodb:
+      uri: ${MONGODB_URI}
+  rabbitmq:
+    host: ${RABBITMQ_HOST}
+    port: ${RABBITMQ_PORT}
+    username: ${RABBITMQ_USERNAME}
+    password: ${RABBITMQ_PASSWORD}
+
+osie:
+  encryption:
+    default:
+      key: ${OSIE_ENCRYPTION_KEY}

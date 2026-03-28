@@ -1,0 +1,112 @@
+services:
+  mongodb:
+    image: mongo:7
+    container_name: osie-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: osie
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_PASSWORD:-osie}
+      MONGO_INITDB_DATABASE: osie
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - osie-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: osie-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: osie
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-osie}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - osie-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  osie-api:
+    image: ghcr.io/osie-io/osie-api:${OSIE_API_VERSION:-latest}
+    container_name: osie-api
+    restart: unless-stopped
+    user: root
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SPRING_CONFIG_LOCATION: /opt/osie/api/application.yml
+      MONGODB_URI: mongodb://osie:${MONGODB_PASSWORD:-osie}@mongodb:27017/osie?authSource=admin
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USERNAME: osie
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-osie}
+      OSIE_ENCRYPTION_KEY: ${OSIE_ENCRYPTION_KEY:-change-me-in-production}
+    expose:
+      - "8080"
+      - "8081"
+    volumes:
+      - ./config/application.yml:/opt/osie/api/application.yml:ro
+    networks:
+      - osie-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  osie-ui:
+    image: ghcr.io/osie-io/osie-ui:${OSIE_UI_VERSION:-latest}
+    container_name: osie-ui
+    restart: unless-stopped
+    depends_on:
+      osie-api:
+        condition: service_healthy
+    environment:
+      OSIE_API_HOST: ${EXTERNAL_BASE_URL:-http://localhost:3400}
+      OSIE_API_PREFIX: /api-v1
+      OSIE_OAUTH2_ISSUER: ${EXTERNAL_BASE_URL:-http://localhost:3400}
+      OSIE_OAUTH2_CLIENT_ID: ${OSIE_OAUTH2_CLIENT_ID:-cloud-dashboard}
+      OSIE_OAUTH2_SCOPE: ${OSIE_OAUTH2_SCOPES:-openid profile email}
+    expose:
+      - "80"
+    networks:
+      - osie-network
+
+  osie-admin:
+    image: ghcr.io/osie-io/osie-admin:${OSIE_ADMIN_VERSION:-latest}
+    container_name: osie-admin
+    restart: unless-stopped
+    depends_on:
+      osie-api:
+        condition: service_healthy
+    environment:
+      OSIE_API_URL: ${EXTERNAL_BASE_URL:-http://localhost:3400}/api-v1
+      OSIE_OAUTH2_ISSUER: ${EXTERNAL_BASE_URL:-http://localhost:3400}
+      OSIE_OAUTH2_CLIENT_ID: ${OSIE_OAUTH2_ADMIN_CLIENT_ID:-cloud-admin}
+      OSIE_OAUTH2_SCOPES: ${OSIE_OAUTH2_SCOPES:-openid profile email}
+    expose:
+      - "80"
+    networks:
+      - osie-network
+
+networks:
+  osie-network:
+    driver: bridge
+
+volumes:
+  mongodb_data:
+  rabbitmq_data:

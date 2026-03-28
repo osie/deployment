@@ -1,0 +1,21 @@
+apiVersion: rabbitmq.com/v1beta1
+kind: RabbitmqCluster
+metadata:
+  name: rabbitmq
+  namespace: osie
+spec:
+  replicas: 3
+  persistence:
+    storage: 20Gi
+    # storageClassName: local-path
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+  rabbitmq:
+    additionalPlugins:
+      - rabbitmq_management
+      - rabbitmq_prometheus

@@ -1,0 +1,34 @@
+:80, :443 {
+    tls internal
+
+    # Main UI
+    handle / {
+        reverse_proxy osie-ui:80
+    }
+
+    handle /osie_admin* {
+        reverse_proxy osie-admin:80
+    }
+
+    # API routes
+    handle /api-v1* {
+        reverse_proxy osie-api:8080
+    }
+
+    handle /admin_api* {
+        reverse_proxy osie-api:8080
+    }
+
+    handle /v3/api-docs* {
+        reverse_proxy osie-api:8080
+    }
+
+    handle /.well-known* {
+        reverse_proxy osie-api:8080
+    }
+
+    # Default fallback to UI
+    handle {
+        reverse_proxy osie-ui:80
+    }
+}

@@ -1,0 +1,38 @@
+# Example values for deploying OSIE with Percona MongoDB Operator and RabbitMQ Operator
+#
+# Prerequisites:
+#   - Percona MongoDB operator deployed (see infrastructure/percona-mongodb/)
+#   - RabbitMQ operator deployed (see infrastructure/rabbitmq/)
+#   - Both operator-generated secrets exist in the osie namespace:
+#     - percona-server-mongodb-users (created by Percona operator)
+#     - rabbitmq-default-user (created by RabbitMQ operator)
+# Connect to Percona MongoDB Operator instance
+externalMongodb:
+  hosts: "mongodb-rs0"
+  port: 27017
+  database: osie
+  existingSecret: percona-server-mongodb-users
+  existingSecretUsernameKey: MONGODB_DATABASE_ADMIN_USER
+  existingSecretPasswordKey: MONGODB_DATABASE_ADMIN_PASSWORD
+
+# Connect to RabbitMQ Operator instance
+externalRabbitmq:
+  host: rabbitmq
+  port: 5672
+  existingSecret: rabbitmq-default-user
+  existingSecretUsernameKey: username
+  existingSecretPasswordKey: password
+
+
+# For the time being we need to have below settings explicitly set to false for
+# the chart to be backward compatible to older installs where embedded bitnami
+# mongodb, rabbitmq and keycloak charts were used.
+# Disable bundled MongoDB and RabbitMQ (we use the operator-managed instances)
+keycloak:
+  enabled: false
+
+mongodb:
+  enabled: false
+
+rabbitmq:
+  enabled: false

@@ -1,0 +1,66 @@
+apiVersion: psmdb.percona.com/v1
+kind: PerconaServerMongoDB
+metadata:
+  name: mongodb
+  namespace: osie
+spec:
+  crVersion: 1.22.0
+  image: percona/percona-server-mongodb:7.0.18-11
+  imagePullPolicy: IfNotPresent
+
+  sharding:
+    enabled: false
+
+  replsets:
+    - name: rs0
+      size: 3
+      resources:
+        requests:
+          cpu: "1000m"
+          memory: "4Gi"
+        limits:
+          cpu: "2000m"
+          memory: "8Gi"
+      volumeSpec:
+        persistentVolumeClaim:
+          # storageClassName: local-path
+          resources:
+            requests:
+              storage: 50Gi
+      expose:
+        enabled: true
+        type: ClusterIP
+
+  backup:
+    enabled: true
+    pitr:
+      enabled: true
+    storages:
+      s3-backup:
+        type: s3
+        s3:
+          bucket: your-backup-bucket
+          prefix: mongodb/osie
+          region: us-east-1
+          # For S3-compatible storage (e.g. Hetzner, MinIO), set the endpoint:
+          # endpointUrl: https://fsn1.your-objectstorage.com
+          credentialsSecret: mongodb-backup-s3
+    tasks:
+      - name: daily-backup
+        enabled: true
+        schedule: "0 3 * * *"
+        storageName: s3-backup
+        compressionType: gzip
+        keep: 7
+
+---
+# S3 credentials for backups - create this before applying the PSMDB CR
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-backup-s3
+  namespace: osie
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "your-access-key"
+  AWS_SECRET_ACCESS_KEY: "your-secret-key"
