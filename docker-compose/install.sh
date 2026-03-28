@@ -213,7 +213,7 @@ verify_dns() {
         fi
 
         attempts=$((attempts + 1))
-        if (( attempts % 10 == 0 )); then
+        if [[ $((attempts % 10)) -eq 0 ]]; then
             log "Still waiting for DNS... ($attempts/$max_attempts attempts)"
         fi
         sleep 5
