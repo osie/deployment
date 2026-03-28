@@ -213,12 +213,11 @@ verify_dns() {
         fi
 
         attempts=$((attempts + 1))
-        if [[ $((attempts % 10)) -eq 0 ]]; then
-            log "Still waiting for DNS... ($attempts/$max_attempts attempts)"
-        fi
+        printf "\r\033[1;34m[OSIE]\033[0m Waiting for DNS... (%d/%d)" "$attempts" "$max_attempts"
         sleep 5
     done
 
+    echo ""
     err "DNS verification timed out after $((max_attempts * 5)) seconds. Please verify your DNS configuration."
 }
 
