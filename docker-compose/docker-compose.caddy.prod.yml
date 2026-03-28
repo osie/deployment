@@ -7,7 +7,7 @@ services:
     container_name: osie-caddy
     restart: unless-stopped
     environment:
-      CADDY_DOMAIN: ${CADDY_DOMAIN:?CADDY_DOMAIN must be set}
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME:?PUBLIC_HOSTNAME must be set}
     ports:
       - "80:80"
       - "443:443"

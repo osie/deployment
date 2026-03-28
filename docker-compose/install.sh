@@ -10,14 +10,9 @@ REPO_URL="https://github.com/osie/deployment.git"
 
 # ── Defaults ──────────────────────────────────────────────────
 PUBLIC_HOSTNAME=""
-CADDY_HTTP_PORT=""
-CADDY_HTTPS_PORT=""
+SKIP_DNS_CHECK=false
 BRANCH="main"
 
-# Resolved during setup
-DEPLOY_MODE=""       # "prod" or "dev"
-EXTERNAL_BASE_URL=""
-SELECTED_IP=""
 
 # ── Parse CLI arguments ──────────────────────────────────────
 usage() {
@@ -25,30 +20,26 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  --hostname DOMAIN       Public hostname — enables prod mode (Let's Encrypt)
-  --http-port PORT        External HTTP port — dev mode only (default: 80)
-  --https-port PORT       External HTTPS port — dev mode only (default: 443)
-  --branch BRANCH         Git branch to clone (default: main)
-  -h, --help              Show this help message
+  --hostname DOMAIN     Public hostname for OSIE (e.g. osie.example.com)
+  --skip-dns-check      Skip DNS verification
+  --branch BRANCH       Git branch to clone (default: main)
+  -h, --help            Show this help message
 
-Prod mode (--hostname):
-  Caddy obtains a Let's Encrypt certificate. Ports 80+443 are exposed.
-  The script validates DNS before proceeding.
+When a hostname is provided, Caddy obtains a Let's Encrypt certificate.
+The script validates DNS before proceeding.
 
-Dev mode (no --hostname):
-  Caddy uses a self-signed certificate (tls internal). HTTP and HTTPS
-  are both available. Docker maps external ports to Caddy's :80/:443.
+When no hostname is provided, you choose an IP address and Caddy uses
+its internal CA to generate a self-signed certificate automatically.
 EOF
     exit 0
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --hostname)    PUBLIC_HOSTNAME="$2"; shift 2 ;;
-        --http-port)   CADDY_HTTP_PORT="$2"; shift 2 ;;
-        --https-port)  CADDY_HTTPS_PORT="$2"; shift 2 ;;
-        --branch)      BRANCH="$2"; shift 2 ;;
-        -h|--help)     usage ;;
+        --hostname)       PUBLIC_HOSTNAME="$2"; shift 2 ;;
+        --skip-dns-check) SKIP_DNS_CHECK=true; shift ;;
+        --branch)         BRANCH="$2"; shift 2 ;;
+        -h|--help)  usage ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
 done
@@ -78,17 +69,9 @@ get_public_ipv4s() {
 
 # ── Interactive prompts ───────────────────────────────────────
 
-prompt_mode() {
+prompt_address() {
     if [[ -n "$PUBLIC_HOSTNAME" ]]; then
-        DEPLOY_MODE="prod"
         log "Public hostname: $PUBLIC_HOSTNAME"
-        return
-    fi
-
-    # --http-port or --https-port passed without --hostname → dev mode
-    if [[ -n "$CADDY_HTTP_PORT" || -n "$CADDY_HTTPS_PORT" ]]; then
-        DEPLOY_MODE="dev"
-        prompt_dev_mode
         return
     fi
 
@@ -102,14 +85,12 @@ prompt_mode() {
 
     case "$choice" in
         1)
-            DEPLOY_MODE="prod"
             read -rp "Public hostname (e.g. osie.example.com): " PUBLIC_HOSTNAME
             [[ -z "$PUBLIC_HOSTNAME" ]] && err "Public hostname is required."
             log "Public hostname: $PUBLIC_HOSTNAME"
             ;;
         2)
-            DEPLOY_MODE="dev"
-            prompt_dev_mode
+            prompt_ip_mode
             ;;
         *)
             err "Invalid choice."
@@ -117,13 +98,13 @@ prompt_mode() {
     esac
 }
 
-prompt_dev_mode() {
+prompt_ip_mode() {
     local ips
     ips=$(get_public_ipv4s)
 
     if [[ -z "$ips" ]]; then
         warn "Could not detect any IPv4 addresses."
-        read -rp "Enter the IPv4 address to use: " SELECTED_IP
+        read -rp "Enter the IPv4 address to use: " PUBLIC_HOSTNAME
     else
         echo ""
         log "Detected IPv4 addresses:"
@@ -138,35 +119,19 @@ prompt_dev_mode() {
         echo ""
 
         if [[ ${#ip_array[@]} -eq 1 ]]; then
-            SELECTED_IP="${ip_array[0]}"
-            log "Using ${SELECTED_IP}"
+            PUBLIC_HOSTNAME="${ip_array[0]}"
+            log "Using ${PUBLIC_HOSTNAME}"
         else
             read -rp "Select IP [1]: " ip_choice
             ip_choice="${ip_choice:-1}"
-            SELECTED_IP="${ip_array[$((ip_choice - 1))]}"
+            PUBLIC_HOSTNAME="${ip_array[$((ip_choice - 1))]}"
         fi
     fi
 
-    if [[ -z "$CADDY_HTTPS_PORT" ]]; then
-        read -rp "HTTPS port [443]: " CADDY_HTTPS_PORT
-    fi
-    CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
-
-    if [[ -z "$CADDY_HTTP_PORT" ]]; then
-        read -rp "HTTP port [80]: " CADDY_HTTP_PORT
-    fi
-    CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
-
-    if [[ "$CADDY_HTTPS_PORT" == "443" ]]; then
-        EXTERNAL_BASE_URL="https://${SELECTED_IP}"
-    else
-        EXTERNAL_BASE_URL="https://${SELECTED_IP}:${CADDY_HTTPS_PORT}"
-    fi
-
-    log "OSIE will be available at ${EXTERNAL_BASE_URL} (self-signed certificate)"
+    log "OSIE will be available at https://${PUBLIC_HOSTNAME} (self-signed certificate)"
 }
 
-# ── DNS verification (prod mode only) ────────────────────────
+# ── DNS verification (domain mode only) ──────────────────────
 
 get_ns_for_domain() {
     local domain="$1"
@@ -182,8 +147,16 @@ get_ns_for_domain() {
     echo ""
 }
 
+is_domain() {
+    # Returns 1 (false) for IPs, localhost, and empty strings
+    [[ -n "$PUBLIC_HOSTNAME" ]] \
+        && [[ "$PUBLIC_HOSTNAME" != "localhost" ]] \
+        && ! [[ "$PUBLIC_HOSTNAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
 verify_dns() {
-    [[ "$DEPLOY_MODE" != "prod" ]] && return 0
+    is_domain || return 0
+    [[ "$SKIP_DNS_CHECK" == "true" ]] && { log "Skipping DNS check."; return 0; }
 
     local ips
     ips=$(get_public_ipv4s)
@@ -255,7 +228,7 @@ install_prerequisites() {
     log "Checking required tools..."
 
     local required=(git curl openssl)
-    [[ "$DEPLOY_MODE" == "prod" ]] && required+=(dig)
+    is_domain && required+=(dig)
 
     local missing=()
     for cmd in "${required[@]}"; do
@@ -388,26 +361,18 @@ install_files() {
 
     local src="${tmp_repo}/docker-compose"
 
-    # Copy base compose and config
-    cp "${src}/docker-compose.base.yml" "${INSTALL_DIR}/"
-    rm -rf "${INSTALL_DIR}/config"
-    cp -r "${src}/config" "${INSTALL_DIR}/"
-
-    # Copy the right compose + Caddyfile for the chosen mode
-    mkdir -p "${INSTALL_DIR}/caddy"
-    if [[ "$DEPLOY_MODE" == "prod" ]]; then
-        cp "${src}/docker-compose.caddy.prod.yml" "${INSTALL_DIR}/docker-compose.yml"
-        cp "${src}/caddy/Caddyfile.prod"           "${INSTALL_DIR}/caddy/Caddyfile"
-    else
-        cp "${src}/docker-compose.caddy.dev.yml"  "${INSTALL_DIR}/docker-compose.yml"
-        cp "${src}/caddy/Caddyfile.dev"            "${INSTALL_DIR}/caddy/Caddyfile"
-    fi
+    # Copy files (clean target dirs to ensure idempotency)
+    cp "${src}/docker-compose.base.yml"       "${INSTALL_DIR}/"
+    cp "${src}/docker-compose.caddy.prod.yml" "${INSTALL_DIR}/docker-compose.yml"
+    rm -rf "${INSTALL_DIR}/config" "${INSTALL_DIR}/caddy"
+    cp -r "${src}/config"                     "${INSTALL_DIR}/"
+    cp -r "${src}/caddy"                      "${INSTALL_DIR}/"
 
     # Clean up clone
     rm -rf "${tmp_repo}"
     trap - EXIT
 
-    # Generate .env (preserve secrets from previous install if present)
+    # Generate .env (preserves secrets across re-installs)
     generate_env
 
     # Set permissions
@@ -431,29 +396,10 @@ generate_env() {
     rabbitmq_password="${rabbitmq_password:-$(generate_secret)}"
     encryption_key="${encryption_key:-$(openssl rand -base64 32)}"
 
-    if [[ "$DEPLOY_MODE" == "prod" ]]; then
-        EXTERNAL_BASE_URL="https://${PUBLIC_HOSTNAME}"
-    fi
-
     cat > "${INSTALL_DIR}/.env" <<ENVEOF
 # OSIE — generated by install.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-EXTERNAL_BASE_URL=${EXTERNAL_BASE_URL}
-ENVEOF
-
-    # Mode-specific vars
-    if [[ "$DEPLOY_MODE" == "prod" ]]; then
-        cat >> "${INSTALL_DIR}/.env" <<ENVEOF
-CADDY_DOMAIN=${PUBLIC_HOSTNAME}
-ENVEOF
-    else
-        cat >> "${INSTALL_DIR}/.env" <<ENVEOF
-CADDY_HTTP_PORT=${CADDY_HTTP_PORT}
-CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT}
-ENVEOF
-    fi
-
-    cat >> "${INSTALL_DIR}/.env" <<ENVEOF
+PUBLIC_HOSTNAME=${PUBLIC_HOSTNAME}
 
 MONGODB_PASSWORD=${mongodb_password}
 RABBITMQ_PASSWORD=${rabbitmq_password}
@@ -476,8 +422,8 @@ start_services() {
 
     log "OSIE is starting up. It may take a minute for all services to become healthy."
     log ""
-    log "  URL:  ${EXTERNAL_BASE_URL}"
-    if [[ "$DEPLOY_MODE" == "dev" ]]; then
+    log "  URL:  https://${PUBLIC_HOSTNAME}"
+    if ! is_domain; then
         log "  NOTE: Using a self-signed certificate. Your browser will show a security warning."
     fi
     log ""
@@ -501,7 +447,7 @@ main() {
     echo ""
 
     require_root
-    prompt_mode
+    prompt_address
     install_prerequisites
     verify_dns
     install_docker
