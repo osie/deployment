@@ -54,9 +54,6 @@ services:
       RABBITMQ_USERNAME: osie
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-osie}
       OSIE_ENCRYPTION_KEY: ${OSIE_ENCRYPTION_KEY:-change-me-in-production}
-    expose:
-      - "8080"
-      - "8081"
     volumes:
       - ./config/application.yml:/opt/osie/api/application.yml:ro
     networks:
@@ -76,13 +73,11 @@ services:
       osie-api:
         condition: service_healthy
     environment:
-      OSIE_API_HOST: ${EXTERNAL_BASE_URL:-http://localhost:3400}
+      OSIE_API_HOST: https://${PUBLIC_HOSTNAME:?PUBLIC_HOSTNAME must be set}
       OSIE_API_PREFIX: /api-v1
-      OSIE_OAUTH2_ISSUER: ${EXTERNAL_BASE_URL:-http://localhost:3400}
+      OSIE_OAUTH2_ISSUER: https://${PUBLIC_HOSTNAME:?PUBLIC_HOSTNAME must be set}
       OSIE_OAUTH2_CLIENT_ID: ${OSIE_OAUTH2_CLIENT_ID:-cloud-dashboard}
       OSIE_OAUTH2_SCOPE: ${OSIE_OAUTH2_SCOPES:-openid profile email}
-    expose:
-      - "80"
     networks:
       - osie-network
 
@@ -94,12 +89,10 @@ services:
       osie-api:
         condition: service_healthy
     environment:
-      OSIE_API_URL: ${EXTERNAL_BASE_URL:-http://localhost:3400}/api-v1
-      OSIE_OAUTH2_ISSUER: ${EXTERNAL_BASE_URL:-http://localhost:3400}
+      OSIE_API_URL: https://${PUBLIC_HOSTNAME:?PUBLIC_HOSTNAME must be set}/api-v1
+      OSIE_OAUTH2_ISSUER: https://${PUBLIC_HOSTNAME:?PUBLIC_HOSTNAME must be set}
       OSIE_OAUTH2_CLIENT_ID: ${OSIE_OAUTH2_ADMIN_CLIENT_ID:-cloud-admin}
       OSIE_OAUTH2_SCOPES: ${OSIE_OAUTH2_SCOPES:-openid profile email}
-    expose:
-      - "80"
     networks:
       - osie-network
 

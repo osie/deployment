@@ -1,6 +1,8 @@
-:80, :443 {
-    tls internal
+{
+    default_sni {$PUBLIC_HOSTNAME}
+}
 
+{$PUBLIC_HOSTNAME} {
     # Main UI
     handle / {
         reverse_proxy osie-ui:80
