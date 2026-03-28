@@ -137,7 +137,7 @@ get_ns_for_domain() {
     local domain="$1"
     local zone="$domain"
     while [[ "$zone" == *.* ]]; do
-        ns=$(dig +short NS "$zone" 2>/dev/null | head -1 || true)
+        ns=$(dig +short +time=2 +tries=1 NS "$zone" 2>/dev/null | head -1 || true)
         if [[ -n "$ns" ]]; then
             echo "$ns"
             return
@@ -191,9 +191,9 @@ verify_dns() {
 
     while [[ $attempts -lt $max_attempts ]]; do
         if [[ -n "$ns" ]]; then
-            resolved=$(dig +short A "$PUBLIC_HOSTNAME" "@${ns}" 2>/dev/null | head -1 || true)
+            resolved=$(dig +short +time=2 +tries=1 A "$PUBLIC_HOSTNAME" "@${ns}" 2>/dev/null | head -1 || true)
         else
-            resolved=$(dig +short A "$PUBLIC_HOSTNAME" 2>/dev/null | head -1 || true)
+            resolved=$(dig +short +time=2 +tries=1 A "$PUBLIC_HOSTNAME" 2>/dev/null | head -1 || true)
         fi
 
         if [[ -n "$resolved" ]]; then
@@ -214,11 +214,11 @@ verify_dns() {
 
         attempts=$((attempts + 1))
         printf "\r\033[1;34m[OSIE]\033[0m Waiting for DNS... (%d/%d)" "$attempts" "$max_attempts"
-        sleep 5
+        sleep 3
     done
 
     echo ""
-    err "DNS verification timed out after $((max_attempts * 5)) seconds. Please verify your DNS configuration."
+    err "DNS verification timed out after $((max_attempts * 3)) seconds. Please verify your DNS configuration."
 }
 
 # ── Prerequisites ─────────────────────────────────────────────
