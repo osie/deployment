@@ -4,7 +4,7 @@ Deploy OSIE infrastructure (MongoDB + RabbitMQ) using Kubernetes operators.
 
 ## Prerequisites
 
-- Kubernetes cluster (1.27+)
+- Kubernetes cluster (1.30+)
 - `kubectl` configured
 - `helm` v3 installed
 
@@ -50,29 +50,17 @@ The `kubectl wait` commands block until the operators report the clusters are he
 # Create namespace
 kubectl apply -f infrastructure/namespace.yml
 
-# Deploy MongoDB (pick one)
+# Deploy MongoDB
 kubectl apply -f infrastructure/percona-mongodb/psmdb.single-node.yml   # single node, minimal resources
-kubectl apply -f infrastructure/percona-mongodb/psmdb.ha.yml            # 3-node replica set with S3 backups
+#kubectl apply -f infrastructure/percona-mongodb/psmdb.ha.yml           # 3-node replica set with S3 backups
 
-# Deploy RabbitMQ (pick one)
+# Deploy RabbitMQ
 kubectl apply -f infrastructure/rabbitmq/rabbitmq.single-node.yml       # single node, minimal resources
-kubectl apply -f infrastructure/rabbitmq/rabbitmq.ha.yml                # 3-node cluster
+#kubectl apply -f infrastructure/rabbitmq/rabbitmq.ha.yml               # 3-node cluster
 
 # Wait for both to be ready
 kubectl wait --for=jsonpath='{.status.state}'=ready psmdb/mongodb -n osie --timeout=300s
 kubectl wait rabbitmqcluster/rabbitmq -n osie --for=condition=AllReplicasReady --timeout=300s
-```
-
-### Verify credentials
-
-Both operators auto-generate Kubernetes secrets with random credentials at deploy time.
-
-```bash
-# MongoDB secret
-kubectl get secret percona-server-mongodb-users -n osie
-
-# RabbitMQ secret + username
-kubectl get secret rabbitmq-default-user -n osie -o jsonpath='{.data.username}' | base64 -d
 ```
 
 ## 3. Deploy OSIE (Helm)
@@ -84,17 +72,14 @@ The OSIE Helm chart connects to the operator-managed databases via `existingSecr
 helm repo add osie https://charts.osie.io
 helm repo update
 
-# Review and edit values.example.yaml (update RabbitMQ username from your cluster)
+# Review and edit values.example.yaml
 # Then install:
 helm install osie osie/osie \
   --namespace osie \
   -f values.example.yaml
 ```
 
-See [values.example.yaml](values.example.yaml) for the full configuration.
-
-> **Note:** The RabbitMQ operator generates a random username per cluster. Get yours with:
-> `kubectl get secret rabbitmq-default-user -n osie -o jsonpath='{.data.username}' | base64 -d`
+See [values.example.yaml](values.example.yaml) for the full configuration. Credentials are referenced via `existingSecret` — no manual retrieval needed.
 
 ## File Structure
 
