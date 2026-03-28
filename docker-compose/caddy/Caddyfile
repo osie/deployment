@@ -1,3 +1,7 @@
+{
+    default_sni {$PUBLIC_HOSTNAME}
+}
+
 {$PUBLIC_HOSTNAME} {
     # Main UI
     handle / {

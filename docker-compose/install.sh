@@ -212,7 +212,7 @@ verify_dns() {
             fi
         fi
 
-        ((attempts++))
+        attempts=$((attempts + 1))
         if (( attempts % 10 == 0 )); then
             log "Still waiting for DNS... ($attempts/$max_attempts attempts)"
         fi
@@ -418,7 +418,7 @@ start_services() {
 
     cd "${INSTALL_DIR}"
 
-    docker compose up -d
+    docker compose up -d --force-recreate
 
     log "OSIE is starting up. It may take a minute for all services to become healthy."
     log ""
