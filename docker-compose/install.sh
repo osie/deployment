@@ -8,11 +8,10 @@ set -euo pipefail
 INSTALL_DIR="/opt/osie"
 REPO_URL="https://github.com/osie/deployment.git"
 
-# ── Defaults ──────────────────────────────────────────────────
-PUBLIC_HOSTNAME=""
-SKIP_DNS_CHECK=false
-BRANCH="main"
-
+# ── Defaults (overridable via env vars) ──────────────────────
+PUBLIC_HOSTNAME="${PUBLIC_HOSTNAME:-}"
+SKIP_DNS_CHECK="${SKIP_DNS_CHECK:-false}"
+BRANCH="${BRANCH:-main}"
 
 # ── Parse CLI arguments ──────────────────────────────────────
 usage() {
@@ -20,16 +19,18 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  --hostname DOMAIN     Public hostname for OSIE (e.g. osie.example.com)
+  --hostname DOMAIN     Public hostname or IP (e.g. osie.example.com or 1.2.3.4)
   --skip-dns-check      Skip DNS verification
   --branch BRANCH       Git branch to clone (default: main)
   -h, --help            Show this help message
 
-When a hostname is provided, Caddy obtains a Let's Encrypt certificate.
-The script validates DNS before proceeding.
+Environment variables:
+  PUBLIC_HOSTNAME       Same as --hostname
+  SKIP_DNS_CHECK        Set to "true" to skip DNS check
+  BRANCH                Same as --branch
 
-When no hostname is provided, you choose an IP address and Caddy uses
-its internal CA to generate a self-signed certificate automatically.
+When a domain is provided, Caddy obtains a Let's Encrypt certificate.
+When an IP or localhost is provided, Caddy uses its internal CA.
 EOF
     exit 0
 }
@@ -49,6 +50,9 @@ done
 log()  { echo -e "\033[1;34m[OSIE]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
+
+# read from /dev/tty so prompts work even when piped (curl | bash)
+ask() { read -rp "$1" "$2" </dev/tty; }
 
 require_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -81,11 +85,11 @@ prompt_address() {
     echo "    1) Public domain with automatic HTTPS (Let's Encrypt)"
     echo "    2) IP address with self-signed certificate"
     echo ""
-    read -rp "Choose [1/2]: " choice
+    ask "Choose [1/2]: " choice
 
     case "$choice" in
         1)
-            read -rp "Public hostname (e.g. osie.example.com): " PUBLIC_HOSTNAME
+            ask "Public hostname (e.g. osie.example.com): " PUBLIC_HOSTNAME
             [[ -z "$PUBLIC_HOSTNAME" ]] && err "Public hostname is required."
             log "Public hostname: $PUBLIC_HOSTNAME"
             ;;
@@ -104,7 +108,7 @@ prompt_ip_mode() {
 
     if [[ -z "$ips" ]]; then
         warn "Could not detect any IPv4 addresses."
-        read -rp "Enter the IPv4 address to use: " PUBLIC_HOSTNAME
+        ask "Enter the IPv4 address to use: " PUBLIC_HOSTNAME
     else
         echo ""
         log "Detected IPv4 addresses:"
@@ -122,7 +126,7 @@ prompt_ip_mode() {
             PUBLIC_HOSTNAME="${ip_array[0]}"
             log "Using ${PUBLIC_HOSTNAME}"
         else
-            read -rp "Select IP [1]: " ip_choice
+            ask "Select IP [1]: " ip_choice
             ip_choice="${ip_choice:-1}"
             PUBLIC_HOSTNAME="${ip_array[$((ip_choice - 1))]}"
         fi
@@ -148,7 +152,6 @@ get_ns_for_domain() {
 }
 
 is_domain() {
-    # Returns 1 (false) for IPs, localhost, and empty strings
     [[ -n "$PUBLIC_HOSTNAME" ]] \
         && [[ "$PUBLIC_HOSTNAME" != "localhost" ]] \
         && ! [[ "$PUBLIC_HOSTNAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -174,7 +177,7 @@ verify_dns() {
         warn "Could not detect public IPs. Use your server's public IP address."
     fi
     echo ""
-    read -rp "Press Enter once you have configured the DNS record..."
+    ask "Press Enter once you have configured the DNS record..." _
 
     log "Checking DNS propagation (querying authoritative nameserver)..."
 
@@ -202,11 +205,11 @@ verify_dns() {
                 return 0
             elif [[ -n "$resolved" ]]; then
                 warn "DNS resolves to $resolved (not matching detected server IPs)."
-                read -rp "Continue anyway? [y/N]: " yn
+                ask "Continue anyway? [y/N]: " yn
                 if [[ "${yn,,}" == "y" ]]; then
                     return 0
                 fi
-                read -rp "Press Enter to retry..."
+                ask "Press Enter to retry..." _
                 attempts=0
                 continue
             fi
