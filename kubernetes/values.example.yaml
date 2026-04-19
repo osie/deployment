@@ -7,6 +7,15 @@
 #     - percona-server-mongodb-users (created by Percona operator)
 #     - rabbitmq-default-user (created by RabbitMQ operator)
 # Connect to Percona MongoDB Operator instance
+global:
+  ingress:
+    enabled: true
+    hostname: "osie.mycompany.com"
+    ingressClassName: "traefik"
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt
+    tls: true
+
 externalMongodb:
   hosts: "mongodb-rs0"
   port: 27017
