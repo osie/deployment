@@ -37,7 +37,7 @@ services:
       start_period: 30s
 
   osie-api:
-    image: ghcr.io/osie-io/osie-api:${OSIE_API_VERSION:-latest}
+    image: ghcr.io/osie/osie-api:${OSIE_API_VERSION:-latest}
     container_name: osie-api
     restart: unless-stopped
     user: root
@@ -66,7 +66,7 @@ services:
       start_period: 60s
 
   osie-ui:
-    image: ghcr.io/osie-io/osie-ui:${OSIE_UI_VERSION:-latest}
+    image: ghcr.io/osie/osie-ui:${OSIE_UI_VERSION:-latest}
     container_name: osie-ui
     restart: unless-stopped
     depends_on:
@@ -82,7 +82,7 @@ services:
       - osie-network
 
   osie-admin:
-    image: ghcr.io/osie-io/osie-admin:${OSIE_ADMIN_VERSION:-latest}
+    image: ghcr.io/osie/osie-admin:${OSIE_ADMIN_VERSION:-latest}
     container_name: osie-admin
     restart: unless-stopped
     depends_on:
