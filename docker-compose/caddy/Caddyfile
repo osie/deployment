@@ -29,6 +29,14 @@
         reverse_proxy osie-api:8080
     }
 
+    handle /oauth2* {
+        reverse_proxy osie-api:8080
+    }
+
+    handle /realms* {
+        reverse_proxy osie-api:8080
+    }
+
     # Default fallback to UI
     handle {
         reverse_proxy osie-ui:80
