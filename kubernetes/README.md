@@ -69,7 +69,7 @@ The OSIE Helm chart connects to the operator-managed databases via `existingSecr
 
 ```bash
 # Add the OSIE Helm repo (adjust URL to your registry)
-helm repo add osie https://charts.osie.io
+helm repo add osie https://helm.osie.io
 helm repo update
 
 # Review and edit values.example.yaml
