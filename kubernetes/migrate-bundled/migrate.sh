@@ -10,6 +10,7 @@ KEYCLOAK_OPERATOR_VERSION=26.8.2
 
 RELEASE=${RELEASE:-}
 NAMESPACE=${NAMESPACE:-}
+KUBE_CONTEXT=${KUBE_CONTEXT:-}
 ASSUME_YES=${ASSUME_YES:-0}
 INSTALL_OPERATORS=${INSTALL_OPERATORS:-1}
 OSIE_CHART=${OSIE_CHART:-}
@@ -33,6 +34,8 @@ MUTATED=0
 COMMITTED=0
 KC=()
 HM=()
+CLUSTER_DESC=
+CLUSTER_ID=
 
 if [[ -t 1 ]]; then
   BOLD=$'\e[1m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' DIM=$'\e[2m' RESET=$'\e[0m'
@@ -61,6 +64,7 @@ If any step fails, it puts everything back by itself.
 Options:
   --release <name>     the OSIE helm release (found by itself when there is only one)
   --namespace <ns>     its namespace
+  --context <name>     the kubeconfig context to use (the current one by default)
   --yes                do not ask before starting
   --workdir <dir>      for rollback and cleanup: the folder a migration wrote
 
@@ -80,6 +84,8 @@ parse_args() {
       --release=*) RELEASE=${1#*=} ;;
       --namespace|-n) NAMESPACE=${2:?--namespace needs a value}; shift ;;
       --namespace=*) NAMESPACE=${1#*=} ;;
+      --context|--kube-context) KUBE_CONTEXT=${2:?--context needs a value}; shift ;;
+      --context=*|--kube-context=*) KUBE_CONTEXT=${1#*=} ;;
       --workdir) WORKDIR=${2:?--workdir needs a value}; shift ;;
       --workdir=*) WORKDIR=${1#*=} ;;
       --yes|-y) ASSUME_YES=1 ;;
@@ -90,9 +96,9 @@ parse_args() {
   done
 }
 
-kc() { "${KC[@]}" "$@"; }
-k()  { "${KC[@]}" -n "$NAMESPACE" "$@"; }
-hm() { "${HM[@]}" "$@"; }
+kc() { "${KC[@]}" ${KUBE_CONTEXT:+--context "$KUBE_CONTEXT"} "$@"; }
+k()  { kc -n "$NAMESPACE" "$@"; }
+hm() { "${HM[@]}" ${KUBE_CONTEXT:+--kube-context "$KUBE_CONTEXT"} "$@"; }
 
 checkpoint() { [[ $FAIL_AFTER == "$1" ]] && die "Stopping after '$1' because FAIL_AFTER=$1." || true; }
 
@@ -145,6 +151,7 @@ try_cmd() {
 }
 
 cluster_reachable() { kc get --raw /version >/dev/null 2>&1 && hm list -A >/dev/null 2>&1; }
+cluster_id() { kc get namespace kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null || true; }
 
 detect_tools() {
   step tools "Finding kubectl and helm"
@@ -162,7 +169,10 @@ detect_tools() {
     try_cmd HM "version --short" helm "microk8s helm3" "microk8s helm" \
       || die "No helm found. Install helm 3 or 4, or set HELM, for example HELM=\"microk8s helm3\"."
   fi
-  if ! cluster_reachable && [[ -z ${KUBECONFIG:-} ]]; then
+  if [[ -n $KUBE_CONTEXT ]]; then
+    kc config get-contexts "$KUBE_CONTEXT" >/dev/null 2>&1 \
+      || die "Your kubeconfig has no context \"$KUBE_CONTEXT\". 'kubectl config get-contexts' lists them."
+  elif ! cluster_reachable && [[ -z ${KUBECONFIG:-} ]]; then
     local f
     for f in /etc/rancher/k3s/k3s.yaml /etc/rancher/rke2/rke2.yaml /var/snap/microk8s/current/credentials/client.config; do
       if [[ -r $f ]]; then
@@ -172,11 +182,14 @@ detect_tools() {
       fi
     done
   fi
-  kc get --raw /version >/dev/null 2>&1 || die "\"${KC[*]}\" cannot reach the cluster. Set KUBECONFIG, or KUBECTL to a command that can."
-  hm list -A >/dev/null 2>&1 || die "\"${HM[*]}\" cannot reach the cluster. Set KUBECONFIG, or HELM to a command that can."
+  kc get --raw /version >/dev/null 2>&1 || die "\"${KC[*]}\" cannot reach the cluster${KUBE_CONTEXT:+ of context $KUBE_CONTEXT}. Set KUBECONFIG, --context, or KUBECTL to a command that can."
+  hm list -A >/dev/null 2>&1 || die "\"${HM[*]}\" cannot reach the cluster${KUBE_CONTEXT:+ of context $KUBE_CONTEXT}. Set KUBECONFIG, --context, or HELM to a command that can."
+  CLUSTER_DESC=$(kc config view --minify -o jsonpath='{.contexts[0].name} at {.clusters[0].cluster.server}' 2>/dev/null || true)
+  CLUSTER_ID=$(cluster_id)
   ok "kubectl: ${KC[*]}"
   ok "helm: ${HM[*]} ($(hm version --short 2>/dev/null))"
   [[ -n ${KUBECONFIG:-} ]] && ok "kubeconfig: $KUBECONFIG"
+  [[ -n $CLUSTER_DESC ]] && ok "cluster: $CLUSTER_DESC"
   return 0
 }
 
@@ -600,6 +613,7 @@ check_operators() {
 
 show_plan() {
   step plan "Plan"
+  [[ -n $CLUSTER_DESC ]] && note "Cluster   $CLUSTER_DESC"
   note "Release   $RELEASE in $NAMESPACE (chart $CHART_VERSION, revision $REVISION)"
   if [[ -n $MONGO_WL ]]; then
     note "MongoDB   ${MONGO_WL#*/}  →  Percona MongoDB '$MONGODB_NAME', replica set rs0 of 3, $MONGO_TARGET_SIZE each${MONGO_SC:+, class $MONGO_SC}"
@@ -702,7 +716,8 @@ save_context() {
   {
     printf 'RELEASE=%q\nNAMESPACE=%q\nREVISION=%q\nMONGODB_NAME=%q\nRABBITMQ_NAME=%q\n' "$RELEASE" "$NAMESPACE" "$REVISION" "$MONGODB_NAME" "$RABBITMQ_NAME"
     printf 'KEYCLOAK_NAME=%q\nKEYCLOAK_DB_NAME=%q\nTIMEOUT=%q\n' "$KEYCLOAK_NAME" "$KEYCLOAK_DB_NAME" "$TIMEOUT"
-    printf 'KUBECTL=%q\nHELM=%q\nKUBECONFIG_USED=%q\n' "${KC[*]}" "${HM[*]}" "${KUBECONFIG:-}"
+    printf 'KUBECTL=%q\nHELM=%q\nKUBECONFIG_USED=%q\nKUBE_CONTEXT=%q\n' "${KC[*]}" "${HM[*]}" "${KUBECONFIG:-}" "$KUBE_CONTEXT"
+    printf 'CLUSTER_ID=%q\nCLUSTER_DESC=%q\n' "$CLUSTER_ID" "$CLUSTER_DESC"
   } >"$WORKDIR/context"
 }
 
@@ -1195,10 +1210,14 @@ latest_workdir() {
 load_context() {
   [[ -n $WORKDIR ]] || WORKDIR=$(latest_workdir)
   [[ -f $WORKDIR/context ]] || die "$WORKDIR is not a migration folder."
+  local asked=$KUBE_CONTEXT
   source "$WORKDIR/context"
+  [[ -n $asked ]] && KUBE_CONTEXT=$asked
   [[ -n $KUBECONFIG_USED ]] && export KUBECONFIG=$KUBECONFIG_USED
   read -ra KC <<<"$KUBECTL"
   read -ra HM <<<"$HELM"
+  [[ -z $CLUSTER_ID || $(cluster_id) == "$CLUSTER_ID" ]] \
+    || die "This is not the cluster the migration ran on ($CLUSTER_DESC). Pass --context <name>, or set KUBECONFIG."
   exec > >(tee -a "$WORKDIR/migration.log") 2>&1
 }
 

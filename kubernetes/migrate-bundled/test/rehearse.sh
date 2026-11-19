@@ -287,6 +287,14 @@ after_rollback() {
   fi
 }
 
+elsewhere_kubeconfig() {
+  local f=$RUN/kubeconfig.elsewhere
+  cp "$KUBECONFIG" "$f"
+  KUBECONFIG=$f kubectl config set-cluster elsewhere --server=https://127.0.0.1:9 >/dev/null
+  KUBECONFIG=$f kubectl config set-context elsewhere --cluster=elsewhere --user="kind-$CLUSTER" >/dev/null
+  KUBECONFIG=$f kubectl config use-context elsewhere >/dev/null
+}
+
 main() {
   tools
   if [[ ${REUSE:-0} == 1 ]] && "$KIND" get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
@@ -301,7 +309,8 @@ main() {
   say "migrate.sh${FAIL_AT:+ with FAIL_AFTER=$FAIL_AT}"
   cd "$RUN"
   local rc=0
-  FAIL_AFTER=$FAIL_AT HELM="$HELM_BIN" bash "$MIGRATE" --yes || rc=$?
+  elsewhere_kubeconfig
+  FAIL_AFTER=$FAIL_AT HELM="$HELM_BIN" KUBECONFIG=$RUN/kubeconfig.elsewhere bash "$MIGRATE" --context "kind-$CLUSTER" --yes || rc=$?
   if [[ -n $FAIL_AT ]]; then
     check "migrate.sh failed as asked" test "$rc" -ne 0
     after_rollback
@@ -313,8 +322,10 @@ main() {
       return 1
     fi
     after_success
+    check "rollback refuses a context on another cluster" bash -c \
+      "! HELM=$HELM_BIN KUBECONFIG=$RUN/kubeconfig.elsewhere bash $MIGRATE rollback --yes --context elsewhere >$RUN/wrong-cluster.log 2>&1 && grep -q 'not the cluster the migration ran on' $RUN/wrong-cluster.log"
     say "migrate.sh rollback"
-    HELM="$HELM_BIN" bash "$MIGRATE" rollback --yes || fail "rollback exited non-zero"
+    HELM="$HELM_BIN" KUBECONFIG=$RUN/kubeconfig.elsewhere bash "$MIGRATE" rollback --yes || fail "rollback exited non-zero"
     mongo_counts >/dev/null
     after_rollback
   fi

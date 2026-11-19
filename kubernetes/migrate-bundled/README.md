@@ -25,7 +25,9 @@ bash migrate.sh plan     # shows what it would do, changes nothing
 bash migrate.sh          # shows the plan again, asks, then migrates
 ```
 
-It finds the OSIE release by itself. With several, pass `--release <name> --namespace <namespace>`.
+It works on the current context of your kubeconfig, and the plan names that cluster before anything
+changes. Pass `--context <name>` for another one. It finds the OSIE release by itself. With several, pass
+`--release <name> --namespace <namespace>`.
 
 It finds `kubectl` and `helm` on the `PATH`, or through microk8s, k3s, k0s and rke2. When neither fits,
 name them:
@@ -85,7 +87,8 @@ Once you are confident, free the old volumes:
 bash migrate.sh cleanup
 ```
 
-Both commands work from the folder you ran the migration in, or take `--workdir <folder>`.
+Both commands work from the folder you ran the migration in, or take `--workdir <folder>`. They use the
+context the migration used, and refuse to run against any other cluster.
 
 ## When it stops before starting
 
@@ -104,6 +107,7 @@ Set these as environment variables.
 | Variable | Default | Meaning |
 |---|---|---|
 | `KUBECTL`, `HELM` | found by the script | the commands to run |
+| `KUBE_CONTEXT` | the current context | kubeconfig context to use, the same as `--context` |
 | `OSIE_CHART` | the chart from `OSIE_CHART_REPO` | the osie chart to upgrade with: a `.tgz`, a folder, `repo/chart` or `oci://…`. It must be the version the release runs |
 | `OSIE_CHART_REPO` | `https://helm.osie.io` | where to download the chart |
 | `INSTALL_OPERATORS` | `1` | `0` to refuse to install missing operators |
