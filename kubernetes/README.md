@@ -2,6 +2,9 @@
 
 Deploy OSIE infrastructure (MongoDB + RabbitMQ) using Kubernetes operators.
 
+Already running OSIE with the MongoDB, RabbitMQ and Keycloak that older charts bundled? Move it onto
+these operators with [`migrate-bundled/migrate.sh`](migrate-bundled/README.md).
+
 ## Prerequisites
 
 - Kubernetes cluster (1.30+)
@@ -68,8 +71,8 @@ kubectl wait rabbitmqcluster/rabbitmq -n osie --for=condition=AllReplicasReady -
 The OSIE Helm chart connects to the operator-managed databases via `existingSecret` references — no need to copy passwords into your values file.
 
 ```bash
-# Add the OSIE Helm repo (adjust URL to your registry)
-helm repo add osie https://charts.osie.io
+# Add the OSIE Helm repo
+helm repo add osie https://helm.osie.io
 helm repo update
 
 # Review and edit values.example.yaml
@@ -87,6 +90,10 @@ See [values.example.yaml](values.example.yaml) for the full configuration. Crede
 kubernetes/
 ├── README.md
 ├── values.example.yaml                   # OSIE Helm values for operator-managed DBs
+├── migrate-bundled/
+│   ├── migrate.sh                        # moves a release off the bundled Bitnami services
+│   ├── README.md
+│   └── test/rehearse.sh                  # rehearses migrate.sh on a kind cluster
 └── infrastructure/
     ├── namespace.yml
     ├── percona-mongodb/
