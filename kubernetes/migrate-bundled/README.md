@@ -39,7 +39,8 @@ KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash migrate.sh
 
 What it needs:
 
-- cluster-admin rights, through the same kubeconfig for `kubectl` and `helm` (helm 3.13 or later, or 4)
+- bash 4.4 or later (on macOS, `brew install bash`), and cluster-admin rights through the same kubeconfig
+  for `kubectl` and `helm` (helm 3.14 or later, or 4)
 - room in the cluster for a second copy of the data while both exist
 - internet access for the operators and the chart, unless they are installed already (see *Settings*)
 - a maintenance window: osie-api is stopped from the start of the copy until it runs on the new services.
@@ -49,7 +50,11 @@ What it needs:
 
 1. Checks the release and renders it with the new settings, to confirm that only the services change.
    Nothing is touched if that check fails.
-2. Installs the operators that are missing.
+2. Installs an operator only when its CRD is missing from the cluster: Percona's in `percona-mongodb`,
+   RabbitMQ's in `rabbitmq-system` and CloudNativePG in `cnpg-system`, each watching all namespaces, and the
+   Keycloak operator in the release's namespace. Where the CRD exists, it uses the operator already there and
+   never changes it or its CRD; it first has the cluster check, without creating anything, that the CRD
+   accepts what it will create. Going back never removes an operator or a CRD.
 3. Sets the old volumes to be kept, whatever happens next.
 4. Creates the new MongoDB and RabbitMQ while OSIE keeps running.
 5. Stops osie-api and Keycloak, copies MongoDB and Keycloak's database, and compares every collection and
@@ -74,8 +79,8 @@ Keep them until you move to a chart version without bundled services.
 
 Then sign in to the client portal and the admin as you usually do.
 
-The old volumes stay, so you can go back until you clean up. Going back loses whatever was written to OSIE
-since the migration:
+The old volumes stay, so you can go back until you clean up or upgrade the release again. Going back loses
+whatever was written to OSIE since the migration:
 
 ```bash
 bash migrate.sh rollback
@@ -94,6 +99,9 @@ context the migration used, and refuse to run against any other cluster.
 
 | It says | What to do |
 |---|---|
+| The release runs a chart older than 26.8.0 | Upgrade OSIE to the latest 26.8 chart the way you usually do, then run it again. Without your values file at hand: `helm upgrade <release> osie --repo https://helm.osie.io --version '~26.8' -n <namespace> --reset-then-reuse-values --wait`, adding `--server-side=false` with helm 4 so changes made with `kubectl edit` do not stop the upgrade halfway |
+| The cluster's CRD refuses what the script would create | The operator already installed is too old for it. Upgrade that operator, then run again |
+| Nothing is handling a new service (no status within 3 minutes) | No operator watches the release's namespace. Start one for it, or add the namespace to the ones it watches, then run again. The script has already put everything back |
 | Keycloak runs your own image | Build one `FROM quay.io/keycloak/keycloak:<version>` with your themes and providers under `/opt/keycloak/`, and set `KEYCLOAK_IMAGE` to it |
 | Keycloak uses a database outside this release | The script moves only the bundled PostgreSQL. Contact OSIE support |
 | Something else points at the bundled RabbitMQ | Plan to point it at `rabbitmq.<namespace>.svc:5672` afterwards, then run again with `ALLOW_RABBITMQ_CLIENTS=1` |

@@ -7,11 +7,19 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 MIGRATE=$HERE/../migrate.sh
 CACHE=${CACHE:-$HOME/.cache/osie-migrate-test}
 KIND_VERSION=${KIND_VERSION:-v0.31.0}
-CHART_VERSION=${CHART_VERSION:-26.8.0}
+CHART_VERSION=${CHART_VERSION:-26.8.2}
+START_CHART=${START_CHART:-$CHART_VERSION}
+NEW_CHART=${NEW_CHART:-}
 HELM_BIN=${HELM_BIN:-helm}
+TARGET_CONTEXT=${TARGET_CONTEXT:-}
+NS=${NS:-osie}
+REL=${REL:-osie}
+HOST=${HOST:-osie.test}
+STORAGE_CLASS=${STORAGE_CLASS:-}
 CLUSTER=osie-mig-$SCENARIO${FAIL_AT:+-$FAIL_AT}${SUFFIX:+-$SUFFIX}
 CLUSTER=${CLUSTER:0:32}
-NS=osie
+[[ -z $TARGET_CONTEXT ]] || CLUSTER=remote-$NS
+CTX=${TARGET_CONTEXT:-kind-$CLUSTER}
 PORT=${PORT:-18080}
 RUN=$CACHE/$CLUSTER
 OTP_SECRET=12345678901234567890
@@ -21,7 +29,8 @@ PASSES=0
 FAILS=0
 
 [[ -n ${OSIE_LICENSE_KEY:-} ]] || { echo "Set OSIE_LICENSE_KEY to a license key for osie-api." >&2; exit 2; }
-[[ $SCENARIO == keycloak || $SCENARIO == local ]] || { echo "usage: rehearse.sh keycloak|local [fail-after-step]" >&2; exit 2; }
+[[ $SCENARIO == keycloak || $SCENARIO == local || ($SCENARIO == existing && -n $TARGET_CONTEXT) ]] \
+  || { echo "usage: rehearse.sh keycloak|local [fail-after-step], or TARGET_CONTEXT=<context> rehearse.sh keycloak|local|existing" >&2; exit 2; }
 
 trap 'echo "rehearse.sh stopped at line $LINENO: $BASH_COMMAND" >&2' ERR
 
@@ -52,10 +61,21 @@ IMAGES=(
 )
 
 mkdir -p "$CACHE" "$RUN"
+if [[ -n $TARGET_CONTEXT ]]; then
+  (umask 077 && kubectl config view --raw --minify --context "$TARGET_CONTEXT" >"$RUN/kubeconfig")
+fi
 export KUBECONFIG=$RUN/kubeconfig
 KIND=$CACHE/kind-$KIND_VERSION
 k() { kubectl -n "$NS" "$@"; }
 h() { "$HELM_BIN" "$@"; }
+mig() { HELM="$HELM_BIN" KUBECONFIG=$RUN/kubeconfig.elsewhere bash "$MIGRATE" "$@"; }
+
+if [[ -n $TARGET_CONTEXT ]]; then
+  APP_URL=https://$HOST AUTH_URL=https://auth.$HOST APP_HDR=() AUTH_HDR=()
+else
+  APP_URL=http://127.0.0.1:$PORT AUTH_URL=http://127.0.0.1:$PORT APP_HDR=(-H "Host: $HOST") AUTH_HDR=(-H "Host: auth.$HOST")
+fi
+PUBLIC_URL=${APP_URL/127.0.0.1:$PORT/$HOST}/
 
 tools() {
   if [[ -n ${HELM_VERSION:-} ]]; then
@@ -88,23 +108,85 @@ cluster() {
 }
 
 install_osie() {
-  say "osie $CHART_VERSION with bundled services ($SCENARIO)"
-  cat >"$RUN/values.yaml" <<EOF
-global:
-  ingress:
-    enabled: true
-    hostname: osie.test
-    ingressClassName: traefik
-license:
-  key: "$OSIE_LICENSE_KEY"
-EOF
-  [[ $SCENARIO == local ]] && printf 'keycloak:\n  enabled: false\n' >>"$RUN/values.yaml"
-  h install osie osie --repo https://helm.osie.io --version "$CHART_VERSION" -n "$NS" --create-namespace \
+  say "osie $START_CHART with bundled services ($SCENARIO)"
+  {
+    printf 'global:\n'
+    [[ -z $STORAGE_CLASS ]] || printf '  storageClass: %s\n' "$STORAGE_CLASS"
+    printf '  ingress:\n    enabled: true\n    hostname: %s\n    ingressClassName: traefik\n' "$HOST"
+    [[ -z $TARGET_CONTEXT ]] || printf '    tls: true\n    annotations:\n      cert-manager.io/cluster-issuer: letsencrypt\n'
+    printf 'license:\n  key: "%s"\n' "$OSIE_LICENSE_KEY"
+    [[ $SCENARIO != local ]] || printf 'keycloak:\n  enabled: false\n'
+  } >"$RUN/values.yaml"
+  h install "$REL" osie --repo https://helm.osie.io --version "$START_CHART" -n "$NS" --create-namespace \
     -f "$RUN/values.yaml" --wait --timeout 20m >/dev/null
+  [[ -z $TARGET_CONTEXT ]] || k wait --for=condition=Ready certificate --all --timeout=10m >/dev/null
   k get pods
 }
 
+release_chart() { h list -n "$NS" -f "^$REL\$" -o json | grep -o '"chart":"osie-[^"]*"' | sed 's/.*osie-//; s/"$//'; }
+release_revision() { h history "$REL" -n "$NS" --max 1 -o json | grep -o '"revision":[0-9]*' | sed 's/.*://'; }
+
+upgrade_first() {
+  local from
+  from=$(release_chart)
+  say "chart $from: refused, then upgraded to $CHART_VERSION"
+  check "migrate.sh refuses chart $from and changes nothing" bash -c \
+    "cd $RUN && ! HELM=$HELM_BIN bash $MIGRATE plan --context $CTX --release $REL --namespace $NS >$RUN/old-chart.log 2>&1 && grep -q 'Upgrade OSIE to chart' $RUN/old-chart.log && ! ls -d $RUN/osie-migration-* >/dev/null 2>&1"
+  local ssa=()
+  [[ $(h version --short) == v3* ]] || ssa=(--server-side=false)
+  h upgrade "$REL" osie --repo https://helm.osie.io --version "$CHART_VERSION" -n "$NS" --reset-then-reuse-values \
+    "${ssa[@]}" --set-string "license.key=$OSIE_LICENSE_KEY" --wait --timeout 20m >/dev/null
+  check "osie-api healthy on chart $CHART_VERSION" wait_api
+}
+
+new_chart_refuses() {
+  local rev pvcs
+  rev=$(release_revision)
+  pvcs=$(k get pvc -o name | sort)
+  check "the chart without bundled services refuses a --reuse-values upgrade" bash -c \
+    "! $HELM_BIN upgrade $REL $NEW_CHART -n $NS --reuse-values >$RUN/new-chart-reuse.log 2>&1 && grep -q 'still runs the bundled' $RUN/new-chart-reuse.log"
+  check "the chart without bundled services refuses an upgrade with the values file" bash -c \
+    "! $HELM_BIN upgrade $REL $NEW_CHART -n $NS -f $RUN/values.yaml >$RUN/new-chart-values.log 2>&1 && grep -q 'still runs the bundled' $RUN/new-chart-values.log"
+  check "the refused upgrades changed nothing" bash -c \
+    "[[ \$($HELM_BIN history $REL -n $NS --max 1 -o json | grep -o '\"revision\":[0-9]*' | sed 's/.*://') == $rev && \$(kubectl -n $NS get pvc -o name | sort) == '$pvcs' ]]"
+  check "the bundled services still run" bundled_running
+}
+
+new_chart_upgrades() {
+  say "upgrade to the chart without bundled services"
+  check "the migrated release upgrades to the chart without bundled services" bash -c \
+    "$HELM_BIN upgrade $REL $NEW_CHART -n $NS --reuse-values --wait --timeout 20m >$RUN/new-chart-upgrade.log 2>&1"
+  check "osie-api healthy on the new chart" wait_api
+  if [[ $SCENARIO == keycloak ]]; then
+    check "the Keycloak user signs in on the new chart" user_still_signs_in
+  else
+    check "onboarding stays done on the new chart" onboarding_done
+  fi
+  check "rollback refuses once the release moved on" bash -c \
+    "cd $RUN && ! HELM=$HELM_BIN KUBECONFIG=$RUN/kubeconfig.elsewhere bash $MIGRATE rollback --yes >$RUN/rollback-moved-on.log 2>&1 && grep -q 'changed after the migration' $RUN/rollback-moved-on.log"
+}
+
+old_volumes_gone() {
+  local n
+  for _ in $(seq 36); do
+    n=$(k get pvc -o name | grep -c -E "/($REL-mongodb|data-$REL-rabbitmq-0|data-$REL-postgresql-0)\$" || true)
+    ((n == 0)) && return 0
+    sleep 5
+  done
+  return 1
+}
+
+after_cleanup() {
+  say "migrate.sh cleanup"
+  check "cleanup succeeded" bash -c "cd $RUN && HELM=$HELM_BIN KUBECONFIG=$RUN/kubeconfig.elsewhere bash $MIGRATE cleanup --yes >$RUN/cleanup.log 2>&1"
+  check "the old volumes are deleted" old_volumes_gone
+  check "osie-api stays healthy" wait_api
+  check "rollback refuses after cleanup" bash -c \
+    "cd $RUN && ! HELM=$HELM_BIN KUBECONFIG=$RUN/kubeconfig.elsewhere bash $MIGRATE rollback --yes >$RUN/rollback-after-cleanup.log 2>&1 && grep -q -E 'Cleanup already deleted|changed after the migration' $RUN/rollback-after-cleanup.log"
+}
+
 forward() {
+  [[ -z $TARGET_CONTEXT ]] || return 0
   pkill -f "port-forward.*svc/traefik $PORT:80" 2>/dev/null || true
   kubectl -n traefik port-forward svc/traefik "$PORT:80" >"$RUN/port-forward.log" 2>&1 &
   for _ in $(seq 30); do curl -s -o /dev/null "http://127.0.0.1:$PORT/" && return 0; sleep 1; done
@@ -122,22 +204,22 @@ print("%06d" % ((struct.unpack(">I", d[o:o + 4])[0] & 0x7fffffff) % 1000000))
 EOF
 }
 
-auth() { curl -s -H "Host: auth.osie.test" "$@"; }
-api() { curl -s -H "Host: osie.test" "$@"; }
+auth() { curl -s "${AUTH_HDR[@]}" "$@"; }
+api() { curl -s "${APP_HDR[@]}" "$@"; }
 field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval("d"+sys.argv[1]))' "$1"; }
 
 admin_token() {
   local pw
-  pw=$(k get secret osie-keycloak -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d)
+  pw=$(k get secret "$REL-keycloak" -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d)
   [[ -n $pw ]] || pw=$(cat "$RUN/kc-admin-password")
   printf '%s' "$pw" >"$RUN/kc-admin-password"
-  auth -X POST "http://127.0.0.1:$PORT/realms/master/protocol/openid-connect/token" \
+  auth -X POST "$AUTH_URL/realms/master/protocol/openid-connect/token" \
     -d grant_type=password -d client_id=admin-cli -d username=osie_admin --data-urlencode "password=$pw" | field '["access_token"]'
 }
 
 user_token() {
   local code=${1:-$(totp)}
-  auth -X POST "http://127.0.0.1:$PORT/realms/clients/protocol/openid-connect/token" \
+  auth -X POST "$AUTH_URL/realms/clients/protocol/openid-connect/token" \
     -d grant_type=password -d client_id=osie-ui -d scope=openid -d "username=$USER_EMAIL" \
     --data-urlencode "password=$USER_PASSWORD" -d "totp=$code"
 }
@@ -152,7 +234,7 @@ seed_keycloak() {
   {"type":"otp","userLabel":"phone","secretData":"{\"value\":\"$OTP_SECRET\"}","credentialData":"{\"subType\":\"totp\",\"digits\":6,\"counter\":0,\"period\":30,\"algorithm\":\"HmacSHA1\"}"}]}
 EOF
 )
-  auth -o /dev/null -w '%{http_code}\n' -X POST "http://127.0.0.1:$PORT/admin/realms/clients/users" -H "Authorization: Bearer $at" -H 'Content-Type: application/json' -d "$body"
+  auth -o /dev/null -w '%{http_code}\n' -X POST "$AUTH_URL/admin/realms/clients/users" -H "Authorization: Bearer $at" -H 'Content-Type: application/json' -d "$body"
   sign_in "$RUN/user.before.json" || { echo "no user token" >&2; return 1; }
   user_id "$RUN/user.before.json" >"$RUN/user.id"
   [[ -s $RUN/user.id ]] || { cat "$RUN/user.before.json" >&2; return 1; }
@@ -161,10 +243,10 @@ EOF
 
 seed_local() {
   say "seed: onboard a local admin in osie-api"
-  api -X POST -H 'Content-Type: application/json' "http://127.0.0.1:$PORT/api-v1/admin/onboarding/initialize-user" \
+  api -X POST -H 'Content-Type: application/json' "$APP_URL/api-v1/admin/onboarding/initialize-user" \
     -d "{\"email\":\"admin@osie.test\",\"firstname\":\"Ada\",\"lastname\":\"Admin\",\"password\":\"$USER_PASSWORD\",\"passwordConfirmation\":\"$USER_PASSWORD\"}" -o /dev/null -w '  initialize-user %{http_code}\n'
-  api -X POST -H 'Content-Type: application/json' "http://127.0.0.1:$PORT/api-v1/admin/onboarding/platform-configuration" -d '{"name":"Rehearsal"}' -o /dev/null -w '  platform %{http_code}\n'
-  api -X POST -H 'Content-Type: application/json' "http://127.0.0.1:$PORT/api-v1/admin/onboarding/billing-configuration" \
+  api -X POST -H 'Content-Type: application/json' "$APP_URL/api-v1/admin/onboarding/platform-configuration" -d '{"name":"Rehearsal"}' -o /dev/null -w '  platform %{http_code}\n'
+  api -X POST -H 'Content-Type: application/json' "$APP_URL/api-v1/admin/onboarding/billing-configuration" \
     -d '{"companyName":"Rehearsal SRL","country":"RO","city":"Iasi","address":"Str. 1","currency":"EUR"}' -o /dev/null -w '  billing %{http_code}\n'
 }
 
@@ -175,7 +257,7 @@ sign_in() {
   at=$(field '["access_token"]' <<<"$r" 2>/dev/null) || return 1
   it=$(field '["id_token"]' <<<"$r" 2>/dev/null) || return 1
   [[ -n $at && $at != None ]] || return 1
-  api -X POST -H "Authorization: Bearer $at" "http://127.0.0.1:$PORT/api-v1/user?id_token=$it" >"$1"
+  api -X POST -H "Authorization: Bearer $at" "$APP_URL/api-v1/user?id_token=$it" >"$1"
 }
 
 user_still_signs_in() {
@@ -190,49 +272,101 @@ user_id() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d=d.get
 wrong_otp_refused() { [[ $(user_token 000000 | field '["error"]' 2>/dev/null) == invalid_grant ]]; }
 
 login_page_has_theme() {
-  local page
-  page=$(auth "http://127.0.0.1:$PORT/realms/clients/protocol/openid-connect/auth?client_id=osie-ui&response_type=code&scope=openid&redirect_uri=http%3A%2F%2Fosie.test%2F")
+  local page redirect=${PUBLIC_URL//:/%3A}
+  page=$(auth "$AUTH_URL/realms/clients/protocol/openid-connect/auth?client_id=osie-ui&response_type=code&scope=openid&redirect_uri=${redirect//\//%2F}")
   [[ $page == *"/login/osie/"* ]]
 }
 
-onboarding_done() { [[ $(api -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api-v1/admin/onboarding/status") == 404 ]]; }
+onboarding_done() { [[ $(api -o /dev/null -w '%{http_code}' "$APP_URL/api-v1/admin/onboarding/status") == 404 ]]; }
 
 api_up() {
   local h
-  h=$(kubectl get --raw "/api/v1/namespaces/$NS/pods/http:osie-api-0:8081/proxy/actuator/health" 2>/dev/null) || return 1
-  [[ $h == '{"status":"UP"'* ]]
+  h=$(kubectl get --raw "/api/v1/namespaces/$NS/pods/http:$REL-api-0:8081/proxy/actuator/health" 2>/dev/null) || return 1
+  [[ $h == '{"status":"UP"'* || $h == *'"status":"UP"}' ]]
 }
 
 bundled_running() {
   local n
   for n in mongodb rabbitmq; do
-    [[ -n $(k get pod -l "app.kubernetes.io/instance=osie,app.kubernetes.io/name=$n" --field-selector=status.phase=Running -o name) ]] || return 1
+    [[ -n $(k get pod -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/name=$n" --field-selector=status.phase=Running -o name) ]] || return 1
   done
-  [[ $SCENARIO == local ]] || [[ -n $(k get pod -l "app.kubernetes.io/instance=osie,app.kubernetes.io/name=keycloak" --field-selector=status.phase=Running -o name) ]]
+  [[ $SCENARIO != keycloak ]] || [[ -n $(k get pod -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/name=keycloak" --field-selector=status.phase=Running -o name) ]]
 }
 
 new_services_gone() {
   [[ -z $(k get psmdb,rabbitmqcluster -o name 2>/dev/null) ]] || return 1
   [[ -z $(k get keycloak,cluster.postgresql.cnpg.io -o name 2>/dev/null) ]] || return 1
-  ! k get configmap osie-bundled-migration >/dev/null 2>&1
+  ! k get configmap "$REL-bundled-migration" >/dev/null 2>&1
 }
 
-pv_policies_restored() { [[ -z $(kubectl get pv -o jsonpath='{range .items[*]}{.spec.persistentVolumeReclaimPolicy}{"\n"}{end}' | grep -v Delete) ]]; }
+pv_policies_restored() {
+  [[ -z $(kubectl get pv -o jsonpath='{range .items[*]}{.spec.claimRef.namespace}{" "}{.spec.persistentVolumeReclaimPolicy}{"\n"}{end}' | awk -v ns="$NS" '$1 == ns && $2 != "Delete"') ]]
+}
 
 mongo_counts() {
   local js
   js=$(sed -n "/^MONGO_COUNT_JS='/,/)))'\$/p" "$MIGRATE" | sed -e "1s/^MONGO_COUNT_JS='//" -e "\$s/'\$//")
-  k exec deploy/osie-mongodb -c mongodb -- env DB=osie NOW=$(( $(date +%s) * 1000 )) bash -c 'mongosh --quiet -u root -p "$MONGODB_ROOT_PASSWORD" --authenticationDatabase admin --eval "$1"' _ "$js" 2>/dev/null || true
+  k exec "deploy/$REL-mongodb" -c mongodb -- env DB=osie NOW=$(( $(date +%s) * 1000 )) bash -c 'mongosh --quiet -u root -p "$MONGODB_ROOT_PASSWORD" --authenticationDatabase admin --eval "$1"' _ "$js" 2>/dev/null || true
 }
 
 old_volumes_intact() {
   local n
-  for n in osie-mongodb data-osie-rabbitmq-0; do
+  for n in "$REL-mongodb" "data-$REL-rabbitmq-0"; do
     k get pvc "$n" >/dev/null 2>&1 || return 1
     [[ -z $(k get pvc "$n" -o jsonpath='{.metadata.deletionTimestamp}') ]] || return 1
   done
-  [[ $SCENARIO == local ]] || [[ -z $(k get pvc data-osie-postgresql-0 -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || echo gone) ]]
+  [[ $SCENARIO != keycloak ]] || [[ -z $(k get pvc "data-$REL-postgresql-0" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || echo gone) ]]
 }
+
+operators_kept() {
+  local crd crds=(perconaservermongodbs.psmdb.percona.com rabbitmqclusters.rabbitmq.com)
+  [[ $SCENARIO != keycloak ]] || crds+=(clusters.postgresql.cnpg.io keycloaks.k8s.keycloak.org)
+  for crd in "${crds[@]}"; do kubectl get crd "$crd" >/dev/null 2>&1 || return 1; done
+  local images
+  images=$(kubectl get pods -A --field-selector=status.phase=Running -o jsonpath='{..image}')
+  [[ $images == *percona-server-mongodb-operator:* && $images == */cluster-operator:* ]]
+}
+
+fake_crd() {
+  local group=$1 kind=$2 plural=$3 version=$4 schema=$5
+  kubectl apply -f - >/dev/null <<EOF
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: $plural.$group
+spec:
+  group: $group
+  scope: Namespaced
+  names: {kind: $kind, plural: $plural, listKind: ${kind}List}
+  versions:
+    - name: $version
+      served: true
+      storage: true
+      schema: {openAPIV3Schema: $schema}
+EOF
+}
+
+existing_crd_rules() {
+  say "operators already in the cluster"
+  fake_crd rabbitmq.com RabbitmqCluster rabbitmqclusters v1beta1 \
+    '{type: object, properties: {spec: {type: object, properties: {replicas: {type: integer}}}}}'
+  check "a CRD that refuses what the script creates stops it before any change" bash -c \
+    "cd $RUN && ! HELM=$HELM_BIN bash $MIGRATE plan --context $CTX --release $REL --namespace $NS >$RUN/strict-crd.log 2>&1 && grep -q 'refuses what the script would create' $RUN/strict-crd.log && [[ -z \$(kubectl get ns rabbitmq-system -o name 2>/dev/null) ]]"
+  kubectl delete crd rabbitmqclusters.rabbitmq.com --wait >/dev/null
+  rm -rf "$RUN"/osie-migration-*
+  fake_crd psmdb.percona.com PerconaServerMongoDB perconaservermongodbs v1 '{type: object, x-kubernetes-preserve-unknown-fields: true}'
+  check "a CRD with no operator behind it is caught before downtime and rolled back" bash -c \
+    "cd $RUN && ! HELM=$HELM_BIN bash $MIGRATE --context $CTX --release $REL --namespace $NS --yes >$RUN/orphan-crd.log 2>&1 && grep -q 'Nothing is handling psmdb' $RUN/orphan-crd.log && ! grep -q 'downtime starts' $RUN/orphan-crd.log"
+  check "the failed run left nothing behind" bash -c \
+    "[[ -z \$(kubectl -n $NS get psmdb,rabbitmqcluster -o name 2>/dev/null) ]] && ! kubectl -n $NS get configmap $REL-bundled-migration >/dev/null 2>&1"
+  check "the bundled services kept running" bundled_running
+  kubectl delete crd perconaservermongodbs.psmdb.percona.com --wait >/dev/null
+  rm -rf "$RUN"/osie-migration-*
+}
+
+psmdb_ready() { [[ $(k get psmdb mongodb -o jsonpath='{.status.state}') == ready ]]; }
+bundled_gone() { [[ -z $(k get deploy,sts -l "app.kubernetes.io/instance=$REL" -o name | grep -E 'mongodb|rabbitmq|keycloak|postgresql') ]]; }
+old_pvcs_kept() { [[ -n $(k get pvc -l "app.kubernetes.io/instance=$REL" -o name) ]]; }
 
 mongo_matches() {
   awk 'NR == FNR { now[$1] = $2; next } $1 !~ /^system/ && (now[$1] + 0) < ($2 + 0) { print "  lost in " $1 ": " $2 " -> " now[$1] + 0; bad = 1 } END { exit bad }' \
@@ -241,7 +375,7 @@ mongo_matches() {
 
 wait_api() {
   for _ in $(seq 60); do
-    api_up && k wait --for=condition=Ready pod/osie-api-0 --timeout=5s >/dev/null 2>&1 && return 0
+    api_up && k wait --for=condition=Ready "pod/$REL-api-0" --timeout=5s >/dev/null 2>&1 && return 0
     sleep 5
   done
   return 1
@@ -251,9 +385,9 @@ after_success() {
   say "after migration"
   forward
   check "osie-api healthy on the new services" wait_api
-  check "operator workloads run" bash -c '[[ -n $(kubectl -n osie get psmdb mongodb -o jsonpath={.status.state} | grep ready) ]]'
-  check "bundled workloads are gone" bash -c '[[ -z $(kubectl -n osie get deploy,sts -l app.kubernetes.io/instance=osie -o name | grep -E "mongodb|rabbitmq|keycloak|postgresql") ]]'
-  check "old volumes are kept" bash -c '[[ -n $(kubectl -n osie get pvc -l app.kubernetes.io/instance=osie -o name) ]]'
+  check "operator workloads run" psmdb_ready
+  check "bundled workloads are gone" bundled_gone
+  check "old volumes are kept" old_pvcs_kept
   if [[ $SCENARIO == keycloak ]]; then
     check "the Keycloak user signs in with the old password and OTP, and is the same OSIE user" user_still_signs_in
     check "a wrong OTP is refused" wrong_otp_refused
@@ -262,8 +396,8 @@ after_success() {
     check "onboarding stays done" onboarding_done
   fi
   check "a helm upgrade that brings the bundled services back fails" bash -c \
-    "! $HELM_BIN upgrade osie osie --repo https://helm.osie.io --version $CHART_VERSION -n osie -f $RUN/values.yaml >$RUN/tripwire.log 2>&1 && grep -q -E 'cannot be imported|PASSWORDS ERROR' $RUN/tripwire.log"
-  check "the refused upgrade changed nothing" bash -c "[[ \$($HELM_BIN -n osie history osie --max 1 -o json | grep -o '\"status\":\"[a-z]*\"') == '\"status\":\"deployed\"' ]]"
+    "! $HELM_BIN upgrade $REL osie --repo https://helm.osie.io --version $CHART_VERSION -n $NS -f $RUN/values.yaml >$RUN/tripwire.log 2>&1 && grep -q -E 'cannot be imported|PASSWORDS ERROR' $RUN/tripwire.log"
+  check "the refused upgrade changed nothing" bash -c "[[ \$($HELM_BIN -n $NS history $REL --max 1 -o json | grep -o '\"status\":\"[a-z]*\"') == '\"status\":\"deployed\"' ]]"
 }
 
 after_rollback() {
@@ -272,6 +406,7 @@ after_rollback() {
   check "osie-api healthy again" wait_api
   check "bundled workloads run again" bundled_running
   check "new services and markers are gone" new_services_gone
+  check "operators and their CRDs stay installed" operators_kept
   check "volume reclaim policies are back" pv_policies_restored
   check "the old volumes are bound and not being deleted" old_volumes_intact
   local frozen
@@ -288,29 +423,50 @@ after_rollback() {
 }
 
 elsewhere_kubeconfig() {
-  local f=$RUN/kubeconfig.elsewhere
-  cp "$KUBECONFIG" "$f"
+  local f=$RUN/kubeconfig.elsewhere user
+  user=$(kubectl config view -o jsonpath='{.contexts[0].context.user}')
+  (umask 077 && cp "$KUBECONFIG" "$f")
   KUBECONFIG=$f kubectl config set-cluster elsewhere --server=https://127.0.0.1:9 >/dev/null
-  KUBECONFIG=$f kubectl config set-context elsewhere --cluster=elsewhere --user="kind-$CLUSTER" >/dev/null
+  KUBECONFIG=$f kubectl config set-context elsewhere --cluster=elsewhere --user="$user" >/dev/null
   KUBECONFIG=$f kubectl config use-context elsewhere >/dev/null
+}
+
+migrate_again() {
+  say "migrate.sh again"
+  local rc=0
+  FAIL_AFTER= mig --context "$CTX" --release "$REL" --namespace "$NS" --yes || rc=$?
+  check "the second migration succeeded" test "$rc" -eq 0
+  ((rc == 0)) && after_success
 }
 
 main() {
   tools
-  if [[ ${REUSE:-0} == 1 ]] && "$KIND" get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
+  if [[ -n $TARGET_CONTEXT ]]; then
+    say "cluster $CTX, release $REL in $NS"
+    [[ $SCENARIO == existing || ${REUSE:-0} == 1 ]] || install_osie
+  elif [[ ${REUSE:-0} == 1 ]] && "$KIND" get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
     say "reusing kind cluster $CLUSTER"
   else
     cluster
     install_osie
   fi
+  local current
+  current=$(release_chart)
+  [[ $(printf '%s\n%s\n' "$current" "$CHART_VERSION" | sort -V | sed -n 1p) == "$CHART_VERSION" ]] || upgrade_first
   forward
-  if [[ $SCENARIO == keycloak ]]; then seed_keycloak; else seed_local; fi
+  case $SCENARIO in
+    keycloak) seed_keycloak ;;
+    local) seed_local ;;
+  esac
+  h get values "$REL" -n "$NS" -o yaml >"$RUN/values.yaml"
+  [[ -z $NEW_CHART ]] || new_chart_refuses
+  [[ -n $TARGET_CONTEXT || $SCENARIO != keycloak || -n $FAIL_AT ]] || existing_crd_rules
   mongo_counts >"$RUN/mongo.before"
   say "migrate.sh${FAIL_AT:+ with FAIL_AFTER=$FAIL_AT}"
   cd "$RUN"
   local rc=0
   elsewhere_kubeconfig
-  FAIL_AFTER=$FAIL_AT HELM="$HELM_BIN" KUBECONFIG=$RUN/kubeconfig.elsewhere bash "$MIGRATE" --context "kind-$CLUSTER" --yes || rc=$?
+  FAIL_AFTER=$FAIL_AT mig --context "$CTX" --release "$REL" --namespace "$NS" --yes || rc=$?
   if [[ -n $FAIL_AT ]]; then
     check "migrate.sh failed as asked" test "$rc" -ne 0
     after_rollback
@@ -318,19 +474,24 @@ main() {
     check "migrate.sh succeeded" test "$rc" -eq 0
     if ((rc != 0)); then
       after_rollback
-      say "$PASSES passed, $FAILS failed  (migration failed; cluster $CLUSTER kept, files $RUN)"
+      say "$PASSES passed, $FAILS failed  (migration failed; files $RUN)"
       return 1
     fi
     after_success
     check "rollback refuses a context on another cluster" bash -c \
       "! HELM=$HELM_BIN KUBECONFIG=$RUN/kubeconfig.elsewhere bash $MIGRATE rollback --yes --context elsewhere >$RUN/wrong-cluster.log 2>&1 && grep -q 'not the cluster the migration ran on' $RUN/wrong-cluster.log"
     say "migrate.sh rollback"
-    HELM="$HELM_BIN" KUBECONFIG=$RUN/kubeconfig.elsewhere bash "$MIGRATE" rollback --yes || fail "rollback exited non-zero"
+    mig rollback --yes || fail "rollback exited non-zero"
     mongo_counts >/dev/null
     after_rollback
+    if [[ ${AGAIN:-0} == 1 ]]; then
+      migrate_again
+      [[ -z $NEW_CHART ]] || new_chart_upgrades
+      [[ ${CLEANUP:-0} != 1 ]] || after_cleanup
+    fi
   fi
-  say "$PASSES passed, $FAILS failed  (cluster $CLUSTER, files $RUN)"
-  [[ ${KEEP:-0} == 1 ]] || "$KIND" delete cluster --name "$CLUSTER" >/dev/null 2>&1
+  say "$PASSES passed, $FAILS failed  (cluster $CTX, files $RUN)"
+  [[ -n $TARGET_CONTEXT || ${KEEP:-0} == 1 ]] || "$KIND" delete cluster --name "$CLUSTER" >/dev/null 2>&1
   ((FAILS == 0))
 }
 

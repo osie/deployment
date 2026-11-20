@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 404)) \
+  || { echo "migrate.sh needs bash 4.4 or later; this is $BASH_VERSION. On macOS: brew install bash, then run it with that bash." >&2; exit 1; }
 
 PSMDB_OPERATOR_VERSION=1.22.0
 PSMDB_IMAGE=percona/percona-server-mongodb:7.0.18-11
@@ -7,6 +9,7 @@ RABBITMQ_OPERATOR_VERSION=v2.21.0
 CNPG_VERSION=1.30.2
 CNPG_POSTGRES_IMAGE=ghcr.io/cloudnative-pg/postgresql:17
 KEYCLOAK_OPERATOR_VERSION=26.8.2
+MIN_CHART_VERSION=26.8.0
 
 RELEASE=${RELEASE:-}
 NAMESPACE=${NAMESPACE:-}
@@ -36,6 +39,10 @@ KC=()
 HM=()
 CLUSTER_DESC=
 CLUSTER_ID=
+NEED_OPERATORS=()
+REUSED_OPERATORS=()
+OPERATOR_LINES=()
+HM_APPLY=()
 
 if [[ -t 1 ]]; then
   BOLD=$'\e[1m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' DIM=$'\e[2m' RESET=$'\e[0m'
@@ -152,6 +159,8 @@ try_cmd() {
 
 cluster_reachable() { kc get --raw /version >/dev/null 2>&1 && hm list -A >/dev/null 2>&1; }
 cluster_id() { kc get namespace kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null || true; }
+# Helm 4 applies server-side and refuses fields changed with kubectl; client-side keeps them, as Helm 3 does
+helm_apply_flags() { [[ $(hm version --short 2>/dev/null) == v3* ]] && HM_APPLY=() || HM_APPLY=(--server-side=false); }
 
 detect_tools() {
   step tools "Finding kubectl and helm"
@@ -186,6 +195,7 @@ detect_tools() {
   hm list -A >/dev/null 2>&1 || die "\"${HM[*]}\" cannot reach the cluster${KUBE_CONTEXT:+ of context $KUBE_CONTEXT}. Set KUBECONFIG, --context, or HELM to a command that can."
   CLUSTER_DESC=$(kc config view --minify -o jsonpath='{.contexts[0].name} at {.clusters[0].cluster.server}' 2>/dev/null || true)
   CLUSTER_ID=$(cluster_id)
+  helm_apply_flags
   ok "kubectl: ${KC[*]}"
   ok "helm: ${HM[*]} ($(hm version --short 2>/dev/null))"
   [[ -n ${KUBECONFIG:-} ]] && ok "kubeconfig: $KUBECONFIG"
@@ -194,6 +204,8 @@ detect_tools() {
 }
 
 json_field() { sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}[,}].*/\1/p" <<<"$1" | sed -n 1p; }
+
+version_ge() { [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | sed -n 1p) == "$2" ]]; }
 
 has_line() { local text=$1; shift; awk -v a="$1" -v b="${2:-}" '$0 ~ a && (b == "" || $0 ~ b) { f = 1 } END { exit !f }' <<<"$text"; }
 
@@ -218,6 +230,8 @@ find_release() {
   fi
   IFS=$'\t' read -r RELEASE NAMESPACE CHART_NAME RELEASE_STATUS REVISION <<<"${rows[0]}"
   CHART_VERSION=${CHART_NAME#osie-}
+  version_ge "$CHART_VERSION" "$MIN_CHART_VERSION" \
+    || die "Release $RELEASE runs chart $CHART_VERSION. Upgrade OSIE to chart $MIN_CHART_VERSION or later the way you usually do, then run this again. README.md shows a command for it."
   [[ $RELEASE_STATUS == deployed ]] || die "Release $RELEASE is '$RELEASE_STATUS'. Bring it back to 'deployed' first (helm rollback or a fixed upgrade)."
   k get secret "sh.helm.release.v1.$RELEASE.v$REVISION" >/dev/null 2>&1 \
     || k get configmap "sh.helm.release.v1.$RELEASE.v$REVISION" >/dev/null 2>&1 \
@@ -251,6 +265,7 @@ secret_value() {
 }
 
 cm_value() { k get configmap "$1" -o go-template="{{with index .data \"$2\"}}{{.}}{{end}}" 2>/dev/null || true; }
+current_revision() { hm history "$RELEASE" -n "$NAMESPACE" --max 1 -o json 2>/dev/null | grep -o '"revision":[0-9]*' | sed -n '1s/.*://p'; }
 
 pvc_of() {
   k get pvc -l "app.kubernetes.io/instance=$RELEASE,$1" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
@@ -561,7 +576,7 @@ auth_env() {
 check_render() {
   step render "Checking that only the services change"
   rm -rf "$WORKDIR/render"; mkdir -p "$WORKDIR/render"
-  hm upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values -f "$VALUES" --dry-run=server >"$WORKDIR/render.txt" 2>"$WORKDIR/render.err" \
+  hm upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values -f "$VALUES" "${HM_APPLY[@]}" --dry-run=server >"$WORKDIR/render.txt" 2>"$WORKDIR/render.err" \
     || { cat "$WORKDIR/render.err" >&2; die "helm cannot render the release with the migrated values."; }
   awk -v d="$WORKDIR/render" '/^MANIFEST:/ { m = 1; next } m && /^NOTES:/ { exit } m && /^---/ { n++ } m && n { print > (d "/" sprintf("%03d", n) ".yaml") }' "$WORKDIR/render.txt"
   local f new old ui_container
@@ -586,29 +601,42 @@ check_render() {
   done
 }
 
-all_pod_images() { kc get pods -A --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.spec.containers[*].image}{"\n"}{end}' 2>/dev/null || true; }
-
-operator_running() { has_line "$(all_pod_images)" "$1" "${2:-}"; }
+plan_operator() {
+  local key=$1 label=$2 crd=$3 where=$4
+  if kc get crd "$crd" >/dev/null 2>&1; then
+    REUSED_OPERATORS+=("$key")
+    OPERATOR_LINES+=("$label: uses the operator already installed; it and its CRD stay untouched")
+  else
+    [[ $INSTALL_OPERATORS == 1 ]] || die "No $label operator is installed ($crd is missing). Install it, or run without INSTALL_OPERATORS=0."
+    NEED_OPERATORS+=("$key")
+    OPERATOR_LINES+=("$label: installs $where")
+  fi
+}
 
 check_operators() {
-  NEED_OPERATORS=()
-  PSMDB_CR_VERSION=$PSMDB_OPERATOR_VERSION
-  if [[ -n $MONGO_WL ]]; then
-    if operator_running 'percona-server-mongodb-operator:'; then
-      PSMDB_CR_VERSION=$(all_pod_images | grep -o 'percona-server-mongodb-operator:[0-9][0-9.]*' | sed -n '1s/.*://p')
-    else
-      NEED_OPERATORS+=(psmdb)
-    fi
-  fi
-  if [[ -n $RABBIT_WL ]] && ! operator_running 'cluster-operator:'; then NEED_OPERATORS+=(rabbitmq); fi
+  NEED_OPERATORS=() REUSED_OPERATORS=() OPERATOR_LINES=()
+  [[ -z $MONGO_WL ]] || plan_operator psmdb "Percona MongoDB" perconaservermongodbs.psmdb.percona.com \
+    "$PSMDB_OPERATOR_VERSION in namespace percona-mongodb, watching all namespaces"
+  [[ -z $RABBIT_WL ]] || plan_operator rabbitmq RabbitMQ rabbitmqclusters.rabbitmq.com \
+    "cluster operator ${RABBITMQ_OPERATOR_VERSION#v} in namespace rabbitmq-system, watching all namespaces"
   if [[ -n $KC_WL ]]; then
-    operator_running 'cloudnative-pg/cloudnative-pg:' || NEED_OPERATORS+=(cnpg)
-    operator_running 'keycloak-operator:' "^$NAMESPACE " || NEED_OPERATORS+=(keycloak)
+    plan_operator cnpg CloudNativePG clusters.postgresql.cnpg.io "$CNPG_VERSION in namespace cnpg-system, watching all namespaces"
+    plan_operator keycloak Keycloak keycloaks.k8s.keycloak.org "$KEYCLOAK_OPERATOR_VERSION in namespace $NAMESPACE"
   fi
-  if ((${#NEED_OPERATORS[@]})) && [[ $INSTALL_OPERATORS != 1 ]]; then
-    die "Missing operators: ${NEED_OPERATORS[*]}. Install them, or run without INSTALL_OPERATORS=0."
-  fi
+  local key out
+  for key in "${REUSED_OPERATORS[@]}"; do
+    out=$("${key}_manifest" | k apply --dry-run=server --validate=strict -f - 2>&1 >/dev/null) \
+      || die "The cluster's $key CRD refuses what the script would create, so its operator is older than the script supports. Upgrade that operator, then run again.
+$out"
+  done
   return 0
+}
+
+served_within() {
+  local kind=$1 name=$2 since=$3
+  (( SECONDS - since < 180 )) && return 0
+  [[ -n $(k get "$kind" "$name" -o jsonpath='{.status}' 2>/dev/null) ]] && return 0
+  die "Nothing is handling $kind '$name' in namespace $NAMESPACE: no operator gave it a status within 3 minutes. Start that operator for this namespace, then run again."
 }
 
 show_plan() {
@@ -629,7 +657,8 @@ show_plan() {
     ((${#KC_FEATURES[@]})) && note "          features: ${KC_FEATURES[*]}"
     ((${#KC_IGNORED_ARGS[@]})) && warn "Keycloak arguments not carried over: ${KC_IGNORED_ARGS[*]}"
   fi
-  ((${#NEED_OPERATORS[@]})) && note "Operators to install: ${NEED_OPERATORS[*]}"
+  local o
+  for o in "${OPERATOR_LINES[@]}"; do note "Operator  $o"; done
   note ""
   note "osie-api is stopped while the data is copied, then started on the new services."
   note "If a step fails, everything goes back the way it was. Log and files: $WORKDIR"
@@ -645,7 +674,15 @@ confirm() {
 
 undo_push() { local q; q=$(printf '%q ' "$@"); printf '%s\n' "$q" >>"$WORKDIR/undo"; }
 
-u_delete() { k delete "$1" "$2" --ignore-not-found --wait=true --timeout=10m; }
+u_delete() {
+  local try
+  for try in 1 2 3; do
+    [[ -n $(k get "$1" "$2" -o name 2>/dev/null) ]] || return 0
+    k delete "$1" "$2" --ignore-not-found --wait=true --timeout=10m
+    sleep 5
+  done
+  [[ -z $(k get "$1" "$2" -o name 2>/dev/null) ]] || { warn "$1 '$2' was created again by its operator after each delete; delete it by hand."; return 1; }
+}
 u_delete_pvcs() {
   local pvc
   for pvc in $(k get pvc -l "app.kubernetes.io/instance!=$RELEASE" -o name 2>/dev/null); do
@@ -671,7 +708,7 @@ u_before_helm_rollback() {
   fi
   return 0
 }
-u_helm_rollback() { hm rollback "$RELEASE" "$1" -n "$NAMESPACE" --wait --timeout "$TIMEOUT"; }
+u_helm_rollback() { hm rollback "$RELEASE" "$1" -n "$NAMESPACE" "${HM_APPLY[@]}" --wait --timeout "$TIMEOUT"; }
 u_delete_tripwires() { k delete configmap,secret -l "$MARK=$RELEASE,osie.io/role=tripwire" --ignore-not-found; }
 u_marker() { k delete configmap "$RELEASE-bundled-migration" --ignore-not-found >/dev/null; }
 
@@ -800,14 +837,9 @@ wait_until() {
   done
 }
 
-create_targets() {
-  step targets "Creating the new services (osie keeps running)"
-  local sc
-  if [[ -n $MONGO_WL ]]; then
-    undo_push u_delete_pvcs "mongod-data-$MONGODB_NAME-rs0-"
-    undo_push u_delete psmdb "$MONGODB_NAME"
-    sc=${MONGO_SC:+          storageClassName: $MONGO_SC}
-    k apply -f - >/dev/null <<EOF
+psmdb_manifest() {
+  local sc=${MONGO_SC:+          storageClassName: $MONGO_SC}
+  cat <<EOF
 apiVersion: psmdb.percona.com/v1
 kind: PerconaServerMongoDB
 metadata:
@@ -815,7 +847,6 @@ metadata:
   labels:
     $MARK: $RELEASE
 spec:
-  crVersion: $PSMDB_CR_VERSION
   image: $PSMDB_IMAGE
   secrets:
     users: $MONGODB_NAME-users
@@ -842,13 +873,11 @@ $sc
         enabled: true
         type: ClusterIP
 EOF
-    note "Percona MongoDB '$MONGODB_NAME' created"
-  fi
-  if [[ -n $RABBIT_WL ]]; then
-    undo_push u_delete_pvcs "persistence-$RABBITMQ_NAME-server-"
-    undo_push u_delete rabbitmqcluster "$RABBITMQ_NAME"
-    sc=${RABBIT_SC:+    storageClassName: $RABBIT_SC}
-    k apply -f - >/dev/null <<EOF
+}
+
+rabbitmq_manifest() {
+  local sc=${RABBIT_SC:+    storageClassName: $RABBIT_SC}
+  cat <<EOF
 apiVersion: rabbitmq.com/v1beta1
 kind: RabbitmqCluster
 metadata:
@@ -871,17 +900,47 @@ $sc
       - rabbitmq_management
       - rabbitmq_prometheus
 EOF
+}
+
+create_targets() {
+  step targets "Creating the new services (osie keeps running)"
+  local t0=$SECONDS s mongo_err=
+  if [[ -n $MONGO_WL ]]; then
+    for s in "$MONGODB_NAME-users" "internal-$MONGODB_NAME-users"; do
+      k get secret "$s" >/dev/null 2>&1 || undo_push u_delete secret "$s"
+    done
+    undo_push u_delete_pvcs "mongod-data-$MONGODB_NAME-rs0-"
+    undo_push u_delete psmdb "$MONGODB_NAME"
+    psmdb_manifest | k apply -f - >/dev/null
+    note "Percona MongoDB '$MONGODB_NAME' created"
+  fi
+  if [[ -n $RABBIT_WL ]]; then
+    undo_push u_delete_pvcs "persistence-$RABBITMQ_NAME-server-"
+    undo_push u_delete rabbitmqcluster "$RABBITMQ_NAME"
+    rabbitmq_manifest | k apply -f - >/dev/null
     note "RabbitmqCluster '$RABBITMQ_NAME' created"
   fi
   if [[ -n $MONGO_WL ]]; then
     mongo_ready() { [[ $(k get psmdb "$MONGODB_NAME" -o jsonpath='{.status.state}' 2>/dev/null) == ready ]]; }
-    mongo_ok() { [[ $(k get psmdb "$MONGODB_NAME" -o jsonpath='{.status.state}' 2>/dev/null) != error ]]; }
+    mongo_ok() {
+      if [[ $(k get psmdb "$MONGODB_NAME" -o jsonpath='{.status.state}' 2>/dev/null) == error ]]; then
+        mongo_err=${mongo_err:-$SECONDS}
+        if (( SECONDS - mongo_err >= 180 )); then
+          note "$(k get psmdb "$MONGODB_NAME" -o jsonpath='{.status.message}' 2>/dev/null)"
+          return 1
+        fi
+      else
+        mongo_err=
+      fi
+      served_within psmdb "$MONGODB_NAME" "$t0"
+    }
     wait_until "Percona MongoDB '$MONGODB_NAME'" mongo_ready mongo_ok
     ok "Percona MongoDB '$MONGODB_NAME' is ready"
   fi
   if [[ -n $RABBIT_WL ]]; then
     rabbit_ready() { [[ $(k get rabbitmqcluster "$RABBITMQ_NAME" -o jsonpath='{.status.conditions[?(@.type=="AllReplicasReady")].status}' 2>/dev/null) == True ]]; }
-    wait_until "RabbitmqCluster '$RABBITMQ_NAME'" rabbit_ready
+    rabbit_ok() { served_within rabbitmqcluster "$RABBITMQ_NAME" "$t0"; }
+    wait_until "RabbitmqCluster '$RABBITMQ_NAME'" rabbit_ready rabbit_ok
     ok "RabbitmqCluster '$RABBITMQ_NAME' is ready"
   fi
   checkpoint targets
@@ -958,21 +1017,9 @@ copy_mongodb() {
 
 KC_COUNT_SQL="select 'realms', count(*) from realm union all select 'users', count(*) from user_entity union all select 'credentials', count(*) from credential union all select 'clients', count(*) from client union all select 'identity_providers', count(*) from identity_provider union all select 'keys', count(*) from component where provider_type = 'org.keycloak.keys.KeyProvider'"
 
-copy_keycloak_db() {
-  [[ -n $KC_WL ]] || return 0
-  step keycloak-db "Copying Keycloak's database"
-  local src_secret=$KEYCLOAK_DB_NAME-import-source sc before after
-  undo_push u_delete secret "$src_secret"
-  k create secret generic "$src_secret" --from-literal=username="$KC_DB_USER" --from-literal=password="$KC_DB_PASSWORD" >/dev/null
-  k label secret "$src_secret" "$MARK=$RELEASE" >/dev/null
-  if [[ -n $KC_ADMIN_PASSWORD ]]; then
-    undo_push u_delete secret "$KEYCLOAK_NAME-bundled-admin"
-    k create secret generic "$KEYCLOAK_NAME-bundled-admin" --from-literal=username="${KC_ADMIN_USER:-admin}" --from-literal=password="$KC_ADMIN_PASSWORD" >/dev/null
-    k label secret "$KEYCLOAK_NAME-bundled-admin" "$MARK=$RELEASE" >/dev/null
-  fi
-  undo_push u_delete cluster.postgresql.cnpg.io "$KEYCLOAK_DB_NAME"
-  sc=${PG_SC:+    storageClass: $PG_SC}
-  k apply -f - >/dev/null <<EOF
+cnpg_manifest() {
+  local sc=${PG_SC:+    storageClass: $PG_SC}
+  cat <<EOF
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -1003,12 +1050,30 @@ $sc
         user: $KC_DB_USER
         dbname: $KC_DB_NAME
       password:
-        name: $src_secret
+        name: $KEYCLOAK_DB_NAME-import-source
         key: password
 EOF
+}
+
+copy_keycloak_db() {
+  [[ -n $KC_WL ]] || return 0
+  step keycloak-db "Copying Keycloak's database"
+  local src_secret=$KEYCLOAK_DB_NAME-import-source before after t0
+  undo_push u_delete secret "$src_secret"
+  k create secret generic "$src_secret" --from-literal=username="$KC_DB_USER" --from-literal=password="$KC_DB_PASSWORD" >/dev/null
+  k label secret "$src_secret" "$MARK=$RELEASE" >/dev/null
+  if [[ -n $KC_ADMIN_PASSWORD ]]; then
+    undo_push u_delete secret "$KEYCLOAK_NAME-bundled-admin"
+    k create secret generic "$KEYCLOAK_NAME-bundled-admin" --from-literal=username="${KC_ADMIN_USER:-admin}" --from-literal=password="$KC_ADMIN_PASSWORD" >/dev/null
+    k label secret "$KEYCLOAK_NAME-bundled-admin" "$MARK=$RELEASE" >/dev/null
+  fi
+  undo_push u_delete cluster.postgresql.cnpg.io "$KEYCLOAK_DB_NAME"
+  t0=$SECONDS
+  cnpg_manifest | k apply -f - >/dev/null
   cnpg_ready() { [[ $(k get cluster.postgresql.cnpg.io "$KEYCLOAK_DB_NAME" -o jsonpath='{.status.phase}' 2>/dev/null) == "Cluster in healthy state" ]]; }
   cnpg_ok() {
     local job
+    served_within cluster.postgresql.cnpg.io "$KEYCLOAK_DB_NAME" "$t0"
     job=$({ k get job -l "cnpg.io/cluster=$KEYCLOAK_DB_NAME" -o jsonpath='{range .items[?(@.status.failed)]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true; } | sed -n 1p)
     [[ -z $job ]] && return 0
     k logs "job/$job" --tail=30 2>/dev/null | sed 's/^/    /' || true
@@ -1039,9 +1104,7 @@ keycloak_api_version() {
 
 join_json() { local IFS=,; printf '[%s]' "$*"; }
 
-start_keycloak() {
-  [[ -n $KC_WL ]] || return 0
-  step keycloak "Starting Keycloak $KEYCLOAK_OPERATOR_VERSION on the copy"
+keycloak_manifest() {
   local features='' image='' unsupported='' f arr=()
   for f in "${KC_FEATURES[@]}"; do arr+=("$(json_str "$f")"); done
   ((${#arr[@]})) && features=",\"features\":{\"enabled\":$(join_json "${arr[@]}")}"
@@ -1049,8 +1112,7 @@ start_keycloak() {
   if ((${#KC_MOUNTS_JSON[@]})); then
     unsupported=",\"unsupported\":{\"podTemplate\":{\"spec\":{\"initContainers\":${KC_INIT_JSON:-[]},\"containers\":[{\"volumeMounts\":$(join_json "${KC_MOUNTS_JSON[@]}")}],\"volumes\":$(join_json "${KC_VOLUMES_JSON[@]}")}}}"
   fi
-  undo_push u_delete keycloak "$KEYCLOAK_NAME"
-  k apply -f - >/dev/null <<EOF
+  cat <<EOF
 {"apiVersion":"$(keycloak_api_version)","kind":"Keycloak",
  "metadata":{"name":$(json_str "$KEYCLOAK_NAME"),"labels":{"$MARK":$(json_str "$RELEASE")}},
  "spec":{"instances":$KC_REPLICAS,
@@ -1062,9 +1124,18 @@ start_keycloak() {
   "proxy":{"headers":"xforwarded"},
   "ingress":{"enabled":false}$features$image$unsupported}}
 EOF
+}
+
+start_keycloak() {
+  [[ -n $KC_WL ]] || return 0
+  step keycloak "Starting Keycloak on the copy"
+  local t0=$SECONDS
+  undo_push u_delete keycloak "$KEYCLOAK_NAME"
+  keycloak_manifest | k apply -f - >/dev/null
   kc_ready() { [[ $(k get keycloak "$KEYCLOAK_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null) == True ]]; }
   kc_ok() {
     local sel pods p r
+    served_within keycloak "$KEYCLOAK_NAME" "$t0"
     sel=$(k get svc "$KEYCLOAK_NAME-service" -o go-template='{{range $k, $v := .spec.selector}}{{$k}}={{$v}},{{end}}' 2>/dev/null | sed 's/,$//')
     [[ -z $sel ]] && return 0
     pods=$(k get pod -l "$sel" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].restartCount}{"\n"}{end}' 2>/dev/null)
@@ -1128,21 +1199,27 @@ report_queues() {
 helm_upgrade() {
   step upgrade "Switching the release to the new services"
   undo_push u_helm_rollback "$REVISION"
-  hm upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values -f "$VALUES" --wait --timeout "$TIMEOUT" >"$WORKDIR/upgrade.txt" 2>&1 \
+  hm upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values -f "$VALUES" "${HM_APPLY[@]}" --wait --timeout "$TIMEOUT" >"$WORKDIR/upgrade.txt" 2>&1 \
     || { tail -20 "$WORKDIR/upgrade.txt" | sed 's/^/    /' >&2; die "helm upgrade failed."; }
   undo_push u_before_helm_rollback "${KC_SVC:-}" "${KC_INGRESS:-}" "${MONGO_STANDALONE_PVC:-}"
   ok "Release $RELEASE upgraded; the bundled services are gone, their volumes are kept"
   checkpoint upgrade
 }
 
+health_up() {
+  local h
+  h=$(kc get --raw "$1" 2>/dev/null) || return 1
+  [[ $h == '{"status":"UP"'* || $h == *'"status":"UP"}' ]]
+}
+
 api_healthy() {
-  local pod h
+  local pod base
   pod=$(first_pod "$API_SEL")
   [[ -n $pod ]] || return 1
-  h=$(kc get --raw "/api/v1/namespaces/$NAMESPACE/pods/http:$pod:8081/proxy/actuator/health" 2>/dev/null) || return 1
-  [[ $h == '{"status":"UP"'* ]] || return 1
-  [[ -z $MONGO_WL || $h == *'"mongo":{"status":"UP"'* ]] || return 1
-  [[ -z $RABBIT_WL || $h == *'"rabbit":{"status":"UP"'* ]] || return 1
+  base=/api/v1/namespaces/$NAMESPACE/pods/http:$pod:8081/proxy/actuator/health
+  health_up "$base" || return 1
+  [[ -z $MONGO_WL ]] || health_up "$base/mongo" || return 1
+  [[ -z $RABBIT_WL ]] || health_up "$base/rabbit" || return 1
 }
 
 start_api() {
@@ -1184,7 +1261,7 @@ commit() {
   step commit "Finishing"
   tripwires
   undo_push u_delete_tripwires
-  k patch configmap "$RELEASE-bundled-migration" --type=merge -p "{\"data\":{\"status\":\"migrated\",\"finished\":\"$(date -u +%FT%TZ)\"}}" >/dev/null
+  k patch configmap "$RELEASE-bundled-migration" --type=merge -p "{\"data\":{\"status\":\"migrated\",\"finished\":\"$(date -u +%FT%TZ)\",\"revision\":\"$(current_revision)\"}}" >/dev/null
   COMMITTED=1
   cp "$VALUES" "./values.migrated.$RELEASE.yaml"
   say ""
@@ -1216,6 +1293,7 @@ load_context() {
   [[ -n $KUBECONFIG_USED ]] && export KUBECONFIG=$KUBECONFIG_USED
   read -ra KC <<<"$KUBECTL"
   read -ra HM <<<"$HELM"
+  helm_apply_flags
   [[ -z $CLUSTER_ID || $(cluster_id) == "$CLUSTER_ID" ]] \
     || die "This is not the cluster the migration ran on ($CLUSTER_DESC). Pass --context <name>, or set KUBECONFIG."
   exec > >(tee -a "$WORKDIR/migration.log") 2>&1
@@ -1225,6 +1303,11 @@ cmd_rollback() {
   load_context
   say "Rolling back the migration of $RELEASE in $NAMESPACE (work folder $WORKDIR)."
   [[ $(cm_value "$RELEASE-bundled-migration" status) == cleaned ]] && die "Cleanup already deleted the old volumes; there is nothing to go back to."
+  local left now
+  left=$(cm_value "$RELEASE-bundled-migration" revision)
+  now=$(current_revision)
+  [[ -z $left || $left == "$now" ]] \
+    || die "Release $RELEASE changed after the migration (revision $now; the migration left revision $left), for example by an upgrade to a newer chart. Going back would undo that as well, so nothing was changed."
   if [[ $ASSUME_YES != 1 ]]; then
     [[ -t 0 ]] || die "Not asking without a terminal. Run with --yes."
     local a
