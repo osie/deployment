@@ -13,9 +13,10 @@ operator-managed services in one maintenance window, keeping all data:
 
 Every Keycloak user keeps their password, one-time-password devices, realms, clients, identity providers
 and signing keys. Keycloak keeps its address and keys, so users sign in as before and tokens already issued
-stay valid until they expire; sessions open at the time end, so users sign in once more. Its theme comes
-along: the osie theme of the old chart, your own, or both. The script moves only what the release still
-bundles.
+stay valid until they expire; sessions open at the time end, so users sign in once more. Its themes and
+providers come along when they are provided as volumes or init containers: the osie theme of the old chart,
+your own, or both. Themes built into a Keycloak image are not supported. The script moves only what the
+release still bundles.
 
 ## Step by step
 
@@ -144,7 +145,7 @@ Applications that use this Keycloak need no change.
 | The cluster's CRD refuses what the script would create | The operator already installed is too old for it. Upgrade that operator, then run again |
 | Nothing is handling a new service (no status within 3 minutes) | No operator watches the release's namespace. Start one for it, or add the namespace to the ones it watches, then run again. The script has already put everything back |
 | A storage class does not exist, or there is no default one | Pick one with `--storage-class`, or per service with the variables under *Settings* |
-| Keycloak runs your own image | Build one `FROM quay.io/keycloak/keycloak:<version>` with your themes and providers under `/opt/keycloak/`, and set `KEYCLOAK_IMAGE` to it |
+| Keycloak runs its own image | Themes and providers built into an image are not supported. Provide them as a volume or an init container in the Keycloak values (in the osie chart: `keycloak.extraVolumes`, `keycloak.extraVolumeMounts`, `keycloak.initContainers`), deploy that, then run it again |
 | Keycloak uses a database outside this release | The script moves only the bundled PostgreSQL. Contact OSIE support |
 | Keycloak has no Ingress, or does not answer at the address it found | Set `KEYCLOAK_URL` to the address users reach it at |
 | Keycloak serves under a path such as `/auth` | Not supported by the script. Contact OSIE support |
@@ -167,7 +168,7 @@ about what cannot be changed once the new services exist.
 | `MONGODB_HA` | `1` when the bundled MongoDB was a replica set and 3 nodes take pods, else `0` | `1` puts the three MongoDB members on different nodes. There are always three |
 | `RABBITMQ_REPLICAS` | `3` when the bundled RabbitMQ had 3 or more, else `1` | RabbitMQ nodes, `1` or `3` |
 | `MONGODB_IMAGE`, `POSTGRES_IMAGE` | `percona/percona-server-mongodb:7.0.18-11`, `ghcr.io/cloudnative-pg/postgresql:17` | images of the new MongoDB and Keycloak database, for clusters that pull from a mirror |
-| `RABBITMQ_IMAGE`, `KEYCLOAK_IMAGE` | the image of the operator | images of the new RabbitMQ and Keycloak |
+| `RABBITMQ_IMAGE`, `KEYCLOAK_IMAGE` | the image of the operator | images of the new RabbitMQ and Keycloak, for clusters that pull from a mirror. Themes come from volumes and init containers, never from the image |
 | `MONGODB_NAME`, `RABBITMQ_NAME`, `KEYCLOAK_NAME`, `KEYCLOAK_DB_NAME` | `mongodb`, `rabbitmq`, `keycloak`, `keycloak-db` | names of the new services |
 | `MONGODB_MEMORY` | `2Gi` | memory limit of each MongoDB member |
 | `KEYCLOAK_URL` | the host of the Keycloak release's Ingress | for a Keycloak installed on its own: the address users reach it at |

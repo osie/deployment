@@ -244,7 +244,37 @@ install_osie() {
     printf 'license:\n  key: "%s"\n' "$OSIE_LICENSE_KEY"
     [[ $SCENARIO != local ]] || printf 'keycloak:\n  enabled: false\n'
     [[ ${BUNDLED_HA:-0} != 1 ]] || printf 'mongodb:\n  architecture: replicaset\n  replicaCount: 3\nrabbitmq:\n  replicaCount: 3\n'
+    [[ ${EXTRA_THEME:-0} != 1 ]] || cat <<'EOF'
+keycloak:
+  initContainers: |-
+    - name: osie-keywind-theme
+      image: ghcr.io/osie-io/osie-keywind:0.1.0-rc1
+      command: [sh, -c, "cp -R /theme/* /keycloak-theme"]
+      volumeMounts:
+        - name: keycloak-theme
+          mountPath: /keycloak-theme
+    - name: unrelated-check
+      image: ghcr.io/osie-io/osie-keywind:0.1.0-rc1
+      command: [sh, -c, "true"]
+  extraVolumeMounts: |-
+    - name: keycloak-theme
+      mountPath: /opt/bitnami/keycloak/themes/osie
+    - name: extra-theme
+      mountPath: /opt/bitnami/keycloak/themes/extra
+  extraVolumes: |-
+    - name: keycloak-theme
+      emptyDir: {}
+    - name: extra-theme
+      configMap:
+        name: rehearsal-theme
+        items:
+          - {key: theme.properties, path: login/theme.properties}
+EOF
   } >"$RUN/values.yaml"
+  if [[ ${EXTRA_THEME:-0} == 1 ]]; then
+    kubectl create namespace "$NS" >/dev/null 2>&1 || true
+    k create configmap rehearsal-theme --from-literal=theme.properties='parent=base' --dry-run=client -o yaml | k apply -f - >/dev/null
+  fi
   h install "$REL" osie --repo https://helm.osie.io --version "$START_CHART" -n "$NS" --create-namespace \
     -f "$RUN/values.yaml" --wait --timeout 20m >/dev/null
   [[ -z $TARGET_CONTEXT ]] || k wait --for=condition=Ready certificate --all --timeout=10m >/dev/null
@@ -577,6 +607,13 @@ after_success() {
   check "an upgrade with the values file passed to --values changes nothing" values_file_deploys_as_is
   check "the service files apply as they are, the Keycloak theme included" service_files_apply_as_is
   [[ -z $NEW_STORAGE_CLASS ]] || check "the new volumes use storage class $NEW_STORAGE_CLASS" new_volumes_use_class "$NEW_STORAGE_CLASS"
+  if [[ ${EXTRA_THEME:-0} == 1 ]]; then
+    check "the theme mounted from a ConfigMap is in the new Keycloak" bash -c \
+      "kubectl -n $NS exec keycloak-0 -- cat /opt/keycloak/themes/extra/login/theme.properties | grep -q parent=base"
+    check "the init container that fills no theme was left out, with a warning" bash -c \
+      "! kubectl -n $NS get keycloak keycloak -o json | grep -q unrelated-check && grep -q 'unrelated-check fills no theme' \$(ls -t $RUN/osie-migration-*/migration.log | sed -n 1p)"
+    check "keycloak.$REL.yaml carries both themes" bash -c "grep -q extra-theme $RUN/keycloak.$REL.yaml && grep -q osie-keywind $RUN/keycloak.$REL.yaml"
+  fi
   if [[ ${BUNDLED_HA:-0} == 1 ]]; then
     check "the three MongoDB members run on three different nodes" bash -c \
       "[[ \$(kubectl -n $NS get pod -l app.kubernetes.io/instance=mongodb,app.kubernetes.io/component=mongod -o jsonpath='{range .items[*]}{.spec.nodeName}{\"\\n\"}{end}' | sort -u | wc -l) == 3 ]]"

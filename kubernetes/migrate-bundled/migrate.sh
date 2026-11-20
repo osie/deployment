@@ -490,8 +490,8 @@ discover_keycloak() {
     printf '%s' "$v"
   }
   KC_IMAGE_OLD=$(k get "$KC_WL" -o go-template='{{range .spec.template.spec.containers}}{{if eq .name "keycloak"}}{{.image}}{{end}}{{end}}')
-  if [[ ! $KC_IMAGE_OLD =~ (^|/)bitnami(legacy)?/keycloak: && -z $KEYCLOAK_IMAGE ]]; then
-    die "Keycloak runs your own image ($KC_IMAGE_OLD), which may carry themes or providers. Build one FROM quay.io/keycloak/keycloak:$KEYCLOAK_OPERATOR_VERSION with them under /opt/keycloak/, then set KEYCLOAK_IMAGE to it."
+  if [[ ! $KC_IMAGE_OLD =~ (^|/)bitnami(legacy)?/keycloak[:@] ]]; then
+    die "Keycloak runs its own image ($KC_IMAGE_OLD). Themes and providers built into an image are not supported: provide them as a volume or an init container in the Keycloak values, deploy that, then run this again."
   fi
   local rel_path
   rel_path=$(kc_env KEYCLOAK_HTTP_RELATIVE_PATH)
