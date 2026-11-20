@@ -12,9 +12,10 @@ operator-managed services in one maintenance window, keeping all data:
 | Keycloak and its PostgreSQL | Keycloak from the Keycloak operator, on a CloudNativePG database |
 
 Every Keycloak user keeps their password, one-time-password devices, realms, clients, identity providers
-and signing keys. Keycloak keeps its address, so users sign in as before and tokens stay valid, and its
-theme comes along: the osie theme of the old chart, your own, or both. The script moves only what the
-release still bundles.
+and signing keys. Keycloak keeps its address and keys, so users sign in as before and tokens already issued
+stay valid until they expire; sessions open at the time end, so users sign in once more. Its theme comes
+along: the osie theme of the old chart, your own, or both. The script moves only what the release still
+bundles.
 
 ## Step by step
 
@@ -31,7 +32,9 @@ cp /path/to/your/values.yaml values.yaml
 # 3. What it would do, on which cluster. Nothing changes.
 bash migrate.sh plan --values values.yaml
 
-# 4. The migration. It shows the plan again and asks before it starts.
+# 4. The migration, inside tmux or screen so a dropped connection does not interrupt it.
+#    It shows the plan again and asks before it starts.
+tmux new -s osie-migration
 bash migrate.sh --values values.yaml
 ```
 
@@ -62,7 +65,8 @@ You need:
 - bash 4.4 or later (on macOS, `brew install bash`), and cluster-admin rights through the same kubeconfig
   for `kubectl` and `helm` (helm 3.14 or later, or 4)
 - the release on chart 26.8 or later (see *When it stops before starting*)
-- room in the cluster for a second copy of the data while both exist
+- room in the cluster for the new copies while the old volumes are kept: the new MongoDB has three members,
+  each with a full copy, so plan for three times its data, plus a copy of RabbitMQ's and Keycloak's
 - internet access for the operators and the chart, unless they are installed already
 - a maintenance window: osie-api is stopped from the start of the copy until it runs on the new services.
   For a few gigabytes of data this takes minutes.
@@ -88,7 +92,9 @@ KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash migrate.sh plan --values values.yaml
    RabbitMQ's in `rabbitmq-system` and CloudNativePG in `cnpg-system`, each watching all namespaces, and the
    Keycloak operator in the release's namespace. Where the CRD exists, it uses the operator already there and
    never changes it or its CRD; it first has the cluster check, without creating anything, that the CRD
-   accepts what it will create. Going back never removes an operator or a CRD.
+   accepts what it will create. The Keycloak operator serves only its own namespace, so when its CRD exists
+   but no operator answers in the release's namespace, it installs one there, with its own cluster roles,
+   and leaves the CRD and the other operators alone. Going back never removes an operator or a CRD.
 3. Sets the old volumes to be kept, whatever happens next.
 4. Creates the new MongoDB and RabbitMQ while OSIE keeps running.
 5. Stops osie-api and Keycloak, copies MongoDB and Keycloak's database, and compares every collection and
@@ -98,8 +104,10 @@ KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash migrate.sh plan --values values.yaml
    services.
 8. Writes your values file and the files of the new services.
 
-If any step fails, or you press Ctrl-C, it undoes everything it did in reverse and the release is back on
-the bundled services with its data. The operators stay installed. Fix what it reported and run it again.
+If any step fails, you press Ctrl-C, or the connection drops, it undoes everything it did in reverse and
+the release is back on the bundled services with its data. The operators stay installed. Fix what it
+reported and run it again. Should a step of going back itself fail, it stops there and removes nothing
+more, so the old volumes keep their data; fix what it reports and run `bash migrate.sh rollback`.
 
 An upgrade without the new settings would ask for the bundled services again, so the script leaves small
 objects in the namespace that make such an upgrade fail before it changes anything. The error names one of
@@ -138,7 +146,8 @@ Applications that use this Keycloak need no change.
 | A storage class does not exist, or there is no default one | Pick one with `--storage-class`, or per service with the variables under *Settings* |
 | Keycloak runs your own image | Build one `FROM quay.io/keycloak/keycloak:<version>` with your themes and providers under `/opt/keycloak/`, and set `KEYCLOAK_IMAGE` to it |
 | Keycloak uses a database outside this release | The script moves only the bundled PostgreSQL. Contact OSIE support |
-| Keycloak has no Ingress | Set `KEYCLOAK_URL` to the address users reach it at |
+| Keycloak has no Ingress, or does not answer at the address it found | Set `KEYCLOAK_URL` to the address users reach it at |
+| Keycloak serves under a path such as `/auth` | Not supported by the script. Contact OSIE support |
 | Something else points at the bundled RabbitMQ | Plan to point it at `rabbitmq.<namespace>.svc:5672` afterwards, then run again with `ALLOW_RABBITMQ_CLIENTS=1` |
 | `MONGODB_HA=1`, but fewer than 3 nodes take pods | Leave `MONGODB_HA` unset, or add nodes |
 | osie-api has a HorizontalPodAutoscaler | Set `api.autoscaling.enabled=false`, upgrade, and run again |

@@ -18,8 +18,8 @@ HOST=${HOST:-osie.test}
 BUNDLED_STORAGE_CLASS=${BUNDLED_STORAGE_CLASS:-}
 NEW_STORAGE_CLASS=${NEW_STORAGE_CLASS:-}
 unset STORAGE_CLASS
-CLUSTER=osie-mig-$SCENARIO${FAIL_AT:+-$FAIL_AT}${SUFFIX:+-$SUFFIX}
-CLUSTER=${CLUSTER:0:32}
+CLUSTER=osie-mig-$SCENARIO${SUFFIX:+-$SUFFIX}${FAIL_AT:+-$FAIL_AT}
+CLUSTER=${CLUSTER:0:45}
 [[ -z $TARGET_CONTEXT ]] || CLUSTER=remote-$NS
 CTX=${TARGET_CONTEXT:-kind-$CLUSTER}
 PORT=${PORT:-18080}
@@ -83,7 +83,9 @@ migrate_args() {
 
 install_standalone_keycloak() {
   say "Bitnami Keycloak $KC_CHART_VERSION as its own release $REL in $NS, with the osie theme"
-  cat >"$RUN/keycloak-values.yaml" <<'EOF'
+  local tls=''
+  [[ -z $TARGET_CONTEXT ]] || tls=$'  tls: true\n  annotations:\n    cert-manager.io/cluster-issuer: letsencrypt\n'
+  cat >"$RUN/keycloak-values.yaml" <<EOF
 image:
   repository: bitnamilegacy/keycloak
 auth:
@@ -91,13 +93,15 @@ auth:
 postgresql:
   image:
     repository: bitnamilegacy/postgresql
+${BUNDLED_STORAGE_CLASS:+global:
+  storageClass: $BUNDLED_STORAGE_CLASS}
 keycloakConfigCli:
   enabled: false
 ingress:
   enabled: true
-  hostname: auth.osie.test
+  hostname: auth.$HOST
   ingressClassName: traefik
-extraEnvVars:
+${tls}extraEnvVars:
   - name: KEYCLOAK_PRODUCTION
     value: "true"
   - name: KEYCLOAK_PROXY
@@ -118,6 +122,7 @@ extraVolumes: |-
 EOF
   h install "$REL" oci://registry-1.docker.io/bitnamicharts/keycloak --version "$KC_CHART_VERSION" -n "$NS" --create-namespace \
     -f "$RUN/keycloak-values.yaml" --wait --timeout 15m >/dev/null
+  [[ -z $TARGET_CONTEXT ]] || k wait --for=condition=Ready certificate --all --timeout=10m >/dev/null
   k get pods
 }
 
@@ -126,7 +131,7 @@ seed_standalone() {
   local at
   at=$(admin_token)
   auth -o /dev/null -w '  realm %{http_code}\n' -X POST "$AUTH_URL/admin/realms" -H "Authorization: Bearer $at" -H 'Content-Type: application/json' -d \
-    '{"realm":"clients","enabled":true,"loginTheme":"osie","clients":[{"clientId":"osie-ui","publicClient":true,"directAccessGrantsEnabled":true,"standardFlowEnabled":true,"redirectUris":["http://osie.test/*"]}]}'
+    "{\"realm\":\"clients\",\"enabled\":true,\"loginTheme\":\"osie\",\"clients\":[{\"clientId\":\"osie-ui\",\"publicClient\":true,\"directAccessGrantsEnabled\":true,\"standardFlowEnabled\":true,\"redirectUris\":[\"${PUBLIC_URL}*\"]}]}"
   seed_user "$at"
   kc_sub >"$RUN/user.sub"
   [[ -s $RUN/user.sub ]] || { echo "no token for the seeded user" >&2; return 1; }
@@ -206,10 +211,18 @@ tools() {
 cluster() {
   say "kind cluster $CLUSTER"
   "$KIND" delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
-  "$KIND" create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --wait 120s
+  if [[ ${BUNDLED_HA:-0} == 1 ]]; then
+    printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n- role: worker\n- role: worker\n- role: worker\n' >"$RUN/kind.yaml"
+    "$KIND" create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --config "$RUN/kind.yaml" --wait 180s
+  else
+    "$KIND" create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --wait 120s
+  fi
   printf '%s\n' "${IMAGES[@]}" | xargs -P 8 -I{} sh -c 'docker image inspect {} >/dev/null 2>&1 || docker pull -q {} >/dev/null' || true
-  printf '%s\n' "${IMAGES[@]}" | xargs -P 4 -I{} sh -c \
-    "docker save {} | docker exec -i $CLUSTER-control-plane ctr -n k8s.io images import --platform linux/amd64 - >/dev/null 2>&1 || echo '  could not preload {}'" || true
+  local node
+  for node in $("$KIND" get nodes --name "$CLUSTER"); do
+    printf '%s\n' "${IMAGES[@]}" | xargs -P 4 -I{} sh -c \
+      "docker save {} | docker exec -i $node ctr -n k8s.io images import --platform linux/amd64 - >/dev/null 2>&1 || echo '  could not preload {} on $node'" || true
+  done
   h upgrade --install traefik traefik --repo https://traefik.github.io/charts -n traefik --create-namespace \
     --set service.spec.type=ClusterIP --set ingressClass.isDefaultClass=true --wait --timeout 5m >/dev/null
   local ip corefile
@@ -230,6 +243,7 @@ install_osie() {
     [[ -z $TARGET_CONTEXT ]] || printf '    tls: true\n    annotations:\n      cert-manager.io/cluster-issuer: letsencrypt\n'
     printf 'license:\n  key: "%s"\n' "$OSIE_LICENSE_KEY"
     [[ $SCENARIO != local ]] || printf 'keycloak:\n  enabled: false\n'
+    [[ ${BUNDLED_HA:-0} != 1 ]] || printf 'mongodb:\n  architecture: replicaset\n  replicaCount: 3\nrabbitmq:\n  replicaCount: 3\n'
   } >"$RUN/values.yaml"
   h install "$REL" osie --repo https://helm.osie.io --version "$START_CHART" -n "$NS" --create-namespace \
     -f "$RUN/values.yaml" --wait --timeout 20m >/dev/null
@@ -283,7 +297,7 @@ new_chart_upgrades() {
 old_volumes_gone() {
   local n
   for _ in $(seq 36); do
-    n=$(k get pvc -o name | grep -c -E "/($REL-mongodb|data-$REL-rabbitmq-0|data-$REL-postgresql-0)\$" || true)
+    n=$(k get pvc -o name | grep -c -E "/($REL-mongodb|datadir-$REL-mongodb-[0-9]+|data-$REL-rabbitmq-[0-9]+|data-$REL-postgresql-0)\$" || true)
     ((n == 0)) && return 0
     sleep 5
   done
@@ -427,12 +441,17 @@ pv_policies_restored() {
 mongo_counts() {
   local js
   js=$(sed -n "/^MONGO_COUNT_JS='/,/)))'\$/p" "$MIGRATE" | sed -e "1s/^MONGO_COUNT_JS='//" -e "\$s/'\$//")
-  k exec "deploy/$REL-mongodb" -c mongodb -- env DB=osie NOW=$(( $(date +%s) * 1000 )) bash -c 'mongosh --quiet -u root -p "$MONGODB_ROOT_PASSWORD" --authenticationDatabase admin --eval "$1"' _ "$js" 2>/dev/null || true
+  local wl
+  wl=$(k get deploy,sts -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/name=mongodb,app.kubernetes.io/component=mongodb" -o name 2>/dev/null | sed -n 1p)
+  [[ -n $wl ]] || return 0
+  k exec "$wl" -c mongodb -- env DB=osie NOW=$(( $(date +%s) * 1000 )) bash -c 'mongosh --quiet -u root -p "$MONGODB_ROOT_PASSWORD" --authenticationDatabase admin --eval "$1"' _ "$js" 2>/dev/null || true
 }
 
 old_volumes_intact() {
   local n
-  for n in "$REL-mongodb" "data-$REL-rabbitmq-0"; do
+  local old=("$REL-mongodb" "data-$REL-rabbitmq-0")
+  [[ ${BUNDLED_HA:-0} != 1 ]] || old=("datadir-$REL-mongodb-0" "datadir-$REL-mongodb-1" "datadir-$REL-mongodb-2" "data-$REL-rabbitmq-0" "data-$REL-rabbitmq-2")
+  for n in "${old[@]}"; do
     k get pvc "$n" >/dev/null 2>&1 || return 1
     [[ -z $(k get pvc "$n" -o jsonpath='{.metadata.deletionTimestamp}') ]] || return 1
   done
@@ -558,6 +577,12 @@ after_success() {
   check "an upgrade with the values file passed to --values changes nothing" values_file_deploys_as_is
   check "the service files apply as they are, the Keycloak theme included" service_files_apply_as_is
   [[ -z $NEW_STORAGE_CLASS ]] || check "the new volumes use storage class $NEW_STORAGE_CLASS" new_volumes_use_class "$NEW_STORAGE_CLASS"
+  if [[ ${BUNDLED_HA:-0} == 1 ]]; then
+    check "the three MongoDB members run on three different nodes" bash -c \
+      "[[ \$(kubectl -n $NS get pod -l app.kubernetes.io/instance=mongodb,app.kubernetes.io/component=mongod -o jsonpath='{range .items[*]}{.spec.nodeName}{\"\\n\"}{end}' | sort -u | wc -l) == 3 ]]"
+    check "RabbitMQ runs 3 nodes, like the bundled one" bash -c \
+      "[[ \$(kubectl -n $NS get rabbitmqcluster rabbitmq -o jsonpath='{.spec.replicas}') == 3 && \$(kubectl -n $NS get pod -l app.kubernetes.io/name=rabbitmq,app.kubernetes.io/component=rabbitmq --field-selector=status.phase=Running -o name | wc -l) == 3 ]]"
+  fi
   if [[ $SCENARIO == keycloak ]]; then
     check "the Keycloak user signs in with the old password and OTP, and is the same OSIE user" user_still_signs_in
     check "a wrong OTP is refused" wrong_otp_refused
@@ -595,6 +620,31 @@ after_rollback() {
   fi
 }
 
+pause_new_mongodb_at_upgrade() {
+  local log
+  for _ in $(seq 1800); do
+    log=$(ls -t "$RUN"/osie-migration-*/migration.log 2>/dev/null | sed -n 1p || true)
+    [[ -n $log ]] && grep -q 'Switching the release to the new services' "$log" && break
+    sleep 1
+  done
+  k patch psmdb mongodb --type=merge -p '{"spec":{"pause":true}}' >/dev/null 2>&1 || true
+}
+
+hang_up_during_copy() {
+  local log pid
+  for _ in $(seq 900); do
+    log=$(ls -t "$RUN"/osie-migration-*/migration.log 2>/dev/null | sed -n 1p || true)
+    [[ -n $log ]] && grep -q 'Copying MongoDB' "$log" && break
+    sleep 1
+  done
+  pid=$(pgrep -f "migrate.sh --context $CTX " | sed -n 1p || true)
+  [[ -n $pid ]] || return 0
+  pkill -HUP -P "$pid" || true
+  kill -HUP "$pid" || true
+}
+
+latest_log_has() { grep -q -- "$1" "$(ls -t "$RUN"/osie-migration-*/migration.log | sed -n 1p)"; }
+
 elsewhere_kubeconfig() {
   local f=$RUN/kubeconfig.elsewhere user
   user=$(kubectl config view -o jsonpath='{.contexts[0].context.user}')
@@ -616,7 +666,9 @@ main() {
   tools
   if [[ -n $TARGET_CONTEXT ]]; then
     say "cluster $CTX, release $REL in $NS"
-    [[ $SCENARIO == existing || ${REUSE:-0} == 1 ]] || install_osie
+    if [[ $SCENARIO != existing && ${REUSE:-0} != 1 ]]; then
+      if [[ $SCENARIO == standalone ]]; then install_standalone_keycloak; else install_osie; fi
+    fi
   elif [[ ${REUSE:-0} == 1 ]] && "$KIND" get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
     say "reusing kind cluster $CLUSTER"
   else
@@ -636,7 +688,7 @@ main() {
   esac
   h get values "$REL" -n "$NS" -o yaml >"$RUN/values.yaml"
   cp "$RUN/values.yaml" "$RUN/customer-values.yaml"
-  rm -f "$RUN"/customer-values.yaml.before-migration-*
+  rm -f "$RUN"/customer-values.yaml.before-migration-* "$RUN"/mongodb.*.yaml "$RUN"/rabbitmq.*.yaml "$RUN"/keycloak.*.yaml
   ensure_storage_class
   migrate_args
   [[ -z $NEW_CHART || $SCENARIO == standalone ]] || new_chart_refuses
@@ -646,9 +698,15 @@ main() {
   cd "$RUN"
   local rc=0
   elsewhere_kubeconfig
-  FAIL_AFTER=$FAIL_AT mig "${MIGRATE_ARGS[@]}" || rc=$?
+  local saboteur=
+  if [[ $FAIL_AT == hangup ]]; then hang_up_during_copy & saboteur=$!; fi
+  if [[ $FAIL_AT == upgrade-fails ]]; then pause_new_mongodb_at_upgrade & saboteur=$!; fi
+  FAIL_AFTER=$FAIL_AT mig "${MIGRATE_ARGS[@]}" </dev/null || rc=$?
+  [[ -z $saboteur ]] || wait "$saboteur" || true
   if [[ -n $FAIL_AT ]]; then
     check "migrate.sh failed as asked" test "$rc" -ne 0
+    [[ $FAIL_AT != upgrade-fails ]] || check "it was the helm upgrade that failed" latest_log_has "helm upgrade failed"
+    [[ $FAIL_AT != hangup ]] || check "the hangup was rolled back, and the log shows it" latest_log_has "Back to the bundled services"
     after_rollback
   else
     check "migrate.sh succeeded" test "$rc" -eq 0
