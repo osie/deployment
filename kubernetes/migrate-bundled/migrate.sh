@@ -4,10 +4,8 @@ set -Eeuo pipefail
   || { echo "migrate.sh needs bash 4.4 or later; this is $BASH_VERSION. On macOS: brew install bash, then run it with that bash." >&2; exit 1; }
 
 PSMDB_OPERATOR_VERSION=1.22.0
-PSMDB_IMAGE=percona/percona-server-mongodb:7.0.18-11
 RABBITMQ_OPERATOR_VERSION=v2.21.0
 CNPG_VERSION=1.30.2
-CNPG_POSTGRES_IMAGE=ghcr.io/cloudnative-pg/postgresql:17
 KEYCLOAK_OPERATOR_VERSION=26.8.2
 MIN_CHART_VERSION=26.8.0
 
@@ -20,8 +18,22 @@ OSIE_CHART=${OSIE_CHART:-}
 OSIE_CHART_REPO=${OSIE_CHART_REPO:-https://helm.osie.io}
 KEYCLOAK_IMAGE=${KEYCLOAK_IMAGE:-}
 MONGODB_NAME=${MONGODB_NAME:-mongodb}
-MONGODB_HA=${MONGODB_HA:-0}
+MONGODB_HA=${MONGODB_HA:-}
 MONGODB_MEMORY=${MONGODB_MEMORY:-2Gi}
+MONGODB_IMAGE=${MONGODB_IMAGE:-percona/percona-server-mongodb:7.0.18-11}
+POSTGRES_IMAGE=${POSTGRES_IMAGE:-ghcr.io/cloudnative-pg/postgresql:17}
+RABBITMQ_IMAGE=${RABBITMQ_IMAGE:-}
+RABBITMQ_REPLICAS=${RABBITMQ_REPLICAS:-}
+STORAGE_CLASS=${STORAGE_CLASS:-}
+MONGODB_STORAGE_CLASS=${MONGODB_STORAGE_CLASS:-}
+RABBITMQ_STORAGE_CLASS=${RABBITMQ_STORAGE_CLASS:-}
+KEYCLOAK_DB_STORAGE_CLASS=${KEYCLOAK_DB_STORAGE_CLASS:-}
+MONGODB_SIZE=${MONGODB_SIZE:-}
+RABBITMQ_SIZE=${RABBITMQ_SIZE:-}
+KEYCLOAK_DB_SIZE=${KEYCLOAK_DB_SIZE:-}
+VALUES_FILE=${VALUES_FILE:-}
+KEYCLOAK_URL=${KEYCLOAK_URL:-}
+KEYCLOAK_CHART=${KEYCLOAK_CHART:-oci://registry-1.docker.io/bitnamicharts/keycloak}
 RABBITMQ_NAME=${RABBITMQ_NAME:-rabbitmq}
 KEYCLOAK_NAME=${KEYCLOAK_NAME:-keycloak}
 KEYCLOAK_DB_NAME=${KEYCLOAK_DB_NAME:-keycloak-db}
@@ -30,6 +42,7 @@ TIMEOUT=${TIMEOUT:-20m}
 WORKDIR=${WORKDIR:-}
 FAIL_AFTER=${FAIL_AFTER:-}
 
+README_URL=https://github.com/osie/deployment/tree/main/kubernetes/migrate-bundled
 MARK=osie.io/migrated-from
 COMMAND=migrate
 CURRENT_STEP=start
@@ -39,6 +52,11 @@ KC=()
 HM=()
 CLUSTER_DESC=
 CLUSTER_ID=
+RELEASE_KIND=osie
+MONGO_WL= RABBIT_WL= KC_WL= PG_WL= API_NAME= UI_NAME= ADMIN_NAME=
+MONGO_STANDALONE_PVC= KC_SVC= KC_INGRESS= RABBIT_POD= VALUES= CHART= DOWNTIME_START=0 KC_NEW_SELECTOR= KC_NEW_PORTS=
+KC_KEEP=()
+SERVICE_FILES=()
 NEED_OPERATORS=()
 REUSED_OPERATORS=()
 OPERATOR_LINES=()
@@ -69,17 +87,24 @@ If any step fails, it puts everything back by itself.
   bash migrate.sh cleanup     delete the old volumes, once you are happy
 
 Options:
-  --release <name>     the OSIE helm release (found by itself when there is only one)
-  --namespace <ns>     its namespace
-  --context <name>     the kubeconfig context to use (the current one by default)
-  --yes                do not ask before starting
-  --workdir <dir>      for rollback and cleanup: the folder a migration wrote
+  --values <file>          the values file you deploy OSIE with: the migration's settings are
+                           merged into it, and rollback puts it back as it was
+  --storage-class <name>   storage class of the new volumes (by default, that of the old ones)
+  --release <name>         the OSIE helm release (found by itself when there is only one)
+  --namespace <ns>         its namespace
+  --context <name>         the kubeconfig context to use (the current one by default)
+  --no-install-operators   stop instead of installing a missing operator
+  --yes                    do not ask before starting
+  --workdir <dir>          for rollback and cleanup: the folder a migration wrote
+  -h, --help               this help
 
 kubectl and helm are found on PATH or through microk8s, k3s, k0s and rke2.
 Set KUBECTL="..." or HELM="..." to use something else, for example
   KUBECTL="microk8s kubectl" HELM="microk8s helm3" bash migrate.sh
 
-All settings are listed in README.md next to this script.
+More settings (sizes, images, names, per-service storage classes, MongoDB spread over nodes)
+are environment variables:
+  $README_URL#settings
 EOF
 }
 
@@ -93,6 +118,11 @@ parse_args() {
       --namespace=*) NAMESPACE=${1#*=} ;;
       --context|--kube-context) KUBE_CONTEXT=${2:?--context needs a value}; shift ;;
       --context=*|--kube-context=*) KUBE_CONTEXT=${1#*=} ;;
+      --values|-f) VALUES_FILE=${2:?--values needs a file}; shift ;;
+      --values=*) VALUES_FILE=${1#*=} ;;
+      --storage-class) STORAGE_CLASS=${2:?--storage-class needs a value}; shift ;;
+      --storage-class=*) STORAGE_CLASS=${1#*=} ;;
+      --no-install-operators) INSTALL_OPERATORS=0 ;;
       --workdir) WORKDIR=${2:?--workdir needs a value}; shift ;;
       --workdir=*) WORKDIR=${1#*=} ;;
       --yes|-y) ASSUME_YES=1 ;;
@@ -210,33 +240,36 @@ version_ge() { [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | sed -n 1p) == "$2" ]
 has_line() { local text=$1; shift; awk -v a="$1" -v b="${2:-}" '$0 ~ a && (b == "" || $0 ~ b) { f = 1 } END { exit !f }' <<<"$text"; }
 
 find_release() {
-  step release "Finding the OSIE release"
-  local all o n ns ch st rv rows=()
+  step release "Finding the release"
+  local all o n ns ch st rv rows=() charts='^osie-[0-9]'
+  [[ -n $RELEASE ]] && charts='^(osie|keycloak)-[0-9]'
   all=$(hm list -A --deployed --failed --pending -o json) || die "helm list failed."
   while read -r o; do
     [[ -z $o ]] && continue
     n=$(json_field "$o" name); ns=$(json_field "$o" namespace); ch=$(json_field "$o" chart)
     st=$(json_field "$o" status); rv=$(json_field "$o" revision)
-    [[ $ch =~ ^osie-[0-9] ]] || continue
+    [[ $ch =~ $charts ]] || continue
     [[ -n $RELEASE && $n != "$RELEASE" ]] && continue
     [[ -n $NAMESPACE && $ns != "$NAMESPACE" ]] && continue
     rows+=("$n"$'\t'"$ns"$'\t'"$ch"$'\t'"$st"$'\t'"$rv")
   done < <(grep -o '{[^{}]*}' <<<"$all" || true)
-  ((${#rows[@]})) || die "No OSIE helm release found${RELEASE:+ named $RELEASE}${NAMESPACE:+ in namespace $NAMESPACE}."
+  ((${#rows[@]})) || die "No OSIE or Keycloak helm release found${RELEASE:+ named $RELEASE}${NAMESPACE:+ in namespace $NAMESPACE}."
   if ((${#rows[@]} > 1)); then
-    say "  Several OSIE releases:"
+    say "  Several releases:"
     printf '    %s\n' "${rows[@]//$'\t'/  }"
     die "Pick one with --release <name> --namespace <ns>."
   fi
   IFS=$'\t' read -r RELEASE NAMESPACE CHART_NAME RELEASE_STATUS REVISION <<<"${rows[0]}"
-  CHART_VERSION=${CHART_NAME#osie-}
-  version_ge "$CHART_VERSION" "$MIN_CHART_VERSION" \
+  RELEASE_KIND=${CHART_NAME%%-[0-9]*}
+  CHART_VERSION=${CHART_NAME#"$RELEASE_KIND"-}
+  [[ $RELEASE_KIND == keycloak ]] || version_ge "$CHART_VERSION" "$MIN_CHART_VERSION" \
     || die "Release $RELEASE runs chart $CHART_VERSION. Upgrade OSIE to chart $MIN_CHART_VERSION or later the way you usually do, then run this again. README.md shows a command for it."
+  [[ $RELEASE_KIND == osie || -z $VALUES_FILE ]] || die "--values is for OSIE releases; $RELEASE is a Keycloak release."
   [[ $RELEASE_STATUS == deployed ]] || die "Release $RELEASE is '$RELEASE_STATUS'. Bring it back to 'deployed' first (helm rollback or a fixed upgrade)."
   k get secret "sh.helm.release.v1.$RELEASE.v$REVISION" >/dev/null 2>&1 \
     || k get configmap "sh.helm.release.v1.$RELEASE.v$REVISION" >/dev/null 2>&1 \
     || die "kubectl does not see the release helm sees. They point at different clusters; set KUBECONFIG for both."
-  ok "$RELEASE in namespace $NAMESPACE, chart $CHART_VERSION, revision $REVISION"
+  ok "$RELEASE in namespace $NAMESPACE, chart $CHART_NAME, revision $REVISION"
 }
 
 workload() {
@@ -282,8 +315,52 @@ issuers_from() {
 
 issuer_of() { awk -F'\t' -v s="$2" '$1 == s { print $2 }' <<<"$1"; }
 
+ingress_url() {
+  local host tls
+  host=$(k get ingress "$1" -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || true)
+  [[ -n $host ]] || return 0
+  tls=$(k get ingress "$1" -o jsonpath='{range .spec.tls[*]}{.hosts}{"\n"}{end}' 2>/dev/null || true)
+  if [[ $tls == *"\"$host\""* ]]; then echo "https://$host"; else echo "http://$host"; fi
+}
+
+check_keycloak_url() {
+  local got
+  command -v curl >/dev/null 2>&1 || { warn "curl is missing, so the address $KC_URL could not be checked."; return 0; }
+  got=$(curl -fsS --max-time 10 "$KC_URL/realms/master/.well-known/openid-configuration" 2>/dev/null || true)
+  if [[ -z $got ]]; then
+    warn "$KC_URL is not reachable from here, so it could not be checked. Set KEYCLOAK_URL if Keycloak is reached at another address."
+  elif [[ $got != *"\"issuer\":\"$KC_URL/realms/master\""* ]]; then
+    die "Keycloak answers at $KC_URL with another issuer ($(grep -o '"issuer":"[^"]*"' <<<"$got")). Set KEYCLOAK_URL to the address in that issuer."
+  fi
+}
+
+hint_own_keycloak() {
+  local i host row ns svc info rel chart
+  i=$(issuer_of "$ISSUERS" main)
+  [[ -n $i ]] || i=$(issuer_of "$ISSUERS" admin)
+  [[ $i == */realms/* ]] || return 0
+  host=${i#*://}
+  host=${host%%[:/]*}
+  row=$(kc get ingress -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{range .spec.rules[*]}{.host}{"|"}{range .http.paths[*]}{.backend.service.name}{","}{end}{" "}{end}{"\n"}{end}' 2>/dev/null \
+    | awk -v h="$host" '{ for (i = 2; i <= NF; i++) { split($i, p, "|"); if (p[1] == h) { split(p[2], s, ","); print $1, s[1]; exit } } }' || true)
+  [[ -n $row ]] || return 0
+  read -r ns svc <<<"$row" || true
+  info=$(kc -n "$ns" get svc "$svc" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/instance} {.metadata.labels.helm\.sh/chart}' 2>/dev/null || true)
+  read -r rel chart <<<"$info" || true
+  [[ -n ${rel:-} && ${chart:-} == keycloak-* ]] || return 0
+  warn "osie-api signs in with the Keycloak of release $rel in namespace $ns, installed from the Bitnami chart. Move it too: bash migrate.sh --release $rel --namespace $ns"
+}
+
 discover() {
   step discover "Looking at what the release runs"
+  if [[ $RELEASE_KIND == keycloak ]]; then
+    MONGO_WL= RABBIT_WL= API_NAME= UI_NAME= ADMIN_NAME=
+    KC_WL=$(workload "app.kubernetes.io/name=keycloak,app.kubernetes.io/component=keycloak")
+    PG_WL=$(workload "app.kubernetes.io/name=postgresql")
+    [[ -n $KC_WL ]] || die "Release $RELEASE runs no Keycloak StatefulSet."
+    discover_keycloak
+    return 0
+  fi
   local comp
   MONGO_WL=$(workload "app.kubernetes.io/name=mongodb,app.kubernetes.io/component=mongodb")
   RABBIT_WL=$(workload "app.kubernetes.io/name=rabbitmq")
@@ -300,6 +377,11 @@ discover() {
              | sed -e 's#^StatefulSet/#statefulset.apps/#' -e 's#^Deployment/#deployment.apps/#')
   [[ -n $API_NAME ]] || die "Could not find the osie-api StatefulSet of release $RELEASE."
 
+  API_CONFIG=$(cm_value "$API_NAME-config" application.yml)
+  [[ -n $API_CONFIG ]] || die "ConfigMap $API_NAME-config has no application.yml."
+  ISSUERS=$(issuers_from <<<"$API_CONFIG")
+  [[ -n $KC_WL ]] || hint_own_keycloak
+
   if [[ -z $MONGO_WL && -z $RABBIT_WL && -z $KC_WL ]]; then
     ok "Release $RELEASE runs no bundled MongoDB, RabbitMQ or Keycloak. Nothing to migrate."
     exit 0
@@ -311,10 +393,6 @@ discover() {
   if has_line "$(k get hpa -o jsonpath='{range .items[*]}{.spec.scaleTargetRef.name}{"\n"}{end}' 2>/dev/null || true)" "^$API_NAME\$"; then
     die "osie-api has a HorizontalPodAutoscaler, which would restart it during the copy. Set api.autoscaling.enabled=false, upgrade, then run this again."
   fi
-
-  API_CONFIG=$(cm_value "$API_NAME-config" application.yml)
-  [[ -n $API_CONFIG ]] || die "ConfigMap $API_NAME-config has no application.yml."
-  ISSUERS=$(issuers_from <<<"$API_CONFIG")
 
   if [[ -n $MONGO_WL ]]; then discover_mongodb; fi
   if [[ -n $RABBIT_WL ]]; then discover_rabbitmq; fi
@@ -333,7 +411,14 @@ discover_mongodb() {
     MONGO_SC=$(k get pvc "${MONGO_PVCS[0]}" -o jsonpath='{.spec.storageClassName}')
     MONGO_SIZE=$(k get pvc "${MONGO_PVCS[0]}" -o jsonpath='{.spec.resources.requests.storage}')
   fi
-  MONGO_TARGET_SIZE=$(size_at_least "$MONGO_SIZE" 10Gi)
+  MONGO_SC=${MONGODB_STORAGE_CLASS:-${STORAGE_CLASS:-$MONGO_SC}}
+  MONGO_TARGET_SIZE=${MONGODB_SIZE:-$(size_at_least "$MONGO_SIZE" 10Gi)}
+  local old_members
+  old_members=$(k get "$MONGO_WL" -o jsonpath='{.spec.replicas}')
+  if [[ -z $MONGODB_HA ]]; then
+    MONGODB_HA=0
+    [[ $MONGO_WL == statefulset* && ${old_members:-1} -ge 2 && $(schedulable_nodes) -ge 3 ]] && MONGODB_HA=1
+  fi
   MONGO_STANDALONE_PVC=
   [[ $MONGO_WL == deployment.apps/* && ${#MONGO_PVCS[@]} -gt 0 ]] && MONGO_STANDALONE_PVC=${MONGO_PVCS[0]}
   MONGO_DATA=$(k exec "$MONGO_POD" -c mongodb -- bash -c "$MONGO_SOURCE_AUTH"'
@@ -356,7 +441,9 @@ discover_rabbitmq() {
     RABBIT_SC=$(k get pvc "${RABBIT_PVCS[0]}" -o jsonpath='{.spec.storageClassName}')
     RABBIT_SIZE=$(k get pvc "${RABBIT_PVCS[0]}" -o jsonpath='{.spec.resources.requests.storage}')
   fi
-  RABBIT_TARGET_SIZE=$(size_at_least "$RABBIT_SIZE" 5Gi)
+  RABBIT_SC=${RABBITMQ_STORAGE_CLASS:-${STORAGE_CLASS:-$RABBIT_SC}}
+  RABBIT_TARGET_SIZE=${RABBITMQ_SIZE:-$(size_at_least "$RABBIT_SIZE" 5Gi)}
+  RABBIT_TARGET_REPLICAS=${RABBITMQ_REPLICAS:-$([[ ${RABBIT_REPLICAS:-1} -ge 3 ]] && echo 3 || echo 1)}
   if k get rabbitmqcluster "$RABBITMQ_NAME" >/dev/null 2>&1; then
     die "A RabbitmqCluster named '$RABBITMQ_NAME' already exists in $NAMESPACE. Set RABBITMQ_NAME to another name."
   fi
@@ -408,7 +495,8 @@ discover_keycloak() {
     PG_SC=$(k get pvc "${PG_PVCS[0]}" -o jsonpath='{.spec.storageClassName}')
     PG_SIZE=$(k get pvc "${PG_PVCS[0]}" -o jsonpath='{.spec.resources.requests.storage}')
   fi
-  PG_TARGET_SIZE=$(size_at_least "$PG_SIZE" 5Gi)
+  PG_SC=${KEYCLOAK_DB_STORAGE_CLASS:-${STORAGE_CLASS:-$PG_SC}}
+  PG_TARGET_SIZE=${KEYCLOAK_DB_SIZE:-$(size_at_least "$PG_SIZE" 5Gi)}
   KC_ADMIN_USER=$(kc_env KEYCLOAK_ADMIN)
   ref=$(container_env_secret "$KC_WL" keycloak KEYCLOAK_ADMIN_PASSWORD)
   KC_ADMIN_PASSWORD=
@@ -426,17 +514,26 @@ discover_keycloak() {
     esac
   done
 
-  I_MAIN=$(issuer_of "$ISSUERS" main)
-  I_ADMIN=$(issuer_of "$ISSUERS" admin)
-  I_ADMIN_API=$(issuer_of "$ISSUERS" admin-api)
-  local any=${I_MAIN:-$I_ADMIN}
-  [[ $any == */realms/* ]] || die "osie-api does not point at Keycloak realms (issuers: ${ISSUERS:-none})."
-  KC_URL=${any%%/realms/*}
-  KC_REALMS=()
-  for i in "$I_MAIN" "$I_ADMIN" "$I_ADMIN_API"; do
-    [[ $i == "$KC_URL"/realms/* ]] && KC_REALMS+=("${i##*/realms/}")
-  done
-  mapfile -t KC_REALMS < <(printf '%s\n' "${KC_REALMS[@]}" | awk 'NF && !seen[$0]++')
+  if [[ $RELEASE_KIND == keycloak ]]; then
+    KC_URL=${KEYCLOAK_URL:-$(ingress_url "${KC_WL#*/}")}
+    [[ -n $KC_URL ]] || die "Could not tell at which address Keycloak is reached: it has no Ingress. Set KEYCLOAK_URL, for example KEYCLOAK_URL=https://auth.example.com."
+    KC_URL=${KC_URL%/}
+    mapfile -t KC_REALMS < <(printf '%s\n' "$KC_DB_PASSWORD" | k exec -i "$PG_POD" -c postgresql -- bash -c 'read -r PGPASSWORD; export PGPASSWORD; psql -h 127.0.0.1 -p "$1" -U "$2" -d "$3" -tAc "select name from realm order by name"' _ "$KC_DB_PORT" "$KC_DB_USER" "$KC_DB_NAME" 2>/dev/null | awk 'NF')
+    ((${#KC_REALMS[@]})) || die "Could not read the realms from Keycloak's database."
+    check_keycloak_url
+  else
+    I_MAIN=$(issuer_of "$ISSUERS" main)
+    I_ADMIN=$(issuer_of "$ISSUERS" admin)
+    I_ADMIN_API=$(issuer_of "$ISSUERS" admin-api)
+    local any=${I_MAIN:-$I_ADMIN}
+    [[ $any == */realms/* ]] || die "osie-api does not point at Keycloak realms (issuers: ${ISSUERS:-none})."
+    KC_URL=${any%%/realms/*}
+    KC_REALMS=()
+    for i in "$I_MAIN" "$I_ADMIN" "$I_ADMIN_API"; do
+      [[ $i == "$KC_URL"/realms/* ]] && KC_REALMS+=("${i##*/realms/}")
+    done
+    mapfile -t KC_REALMS < <(printf '%s\n' "${KC_REALMS[@]}" | awk 'NF && !seen[$0]++')
+  fi
   UI_ACCOUNT=; ADMIN_ACCOUNT=
   [[ -n $UI_NAME ]] && UI_ACCOUNT=$(container_env "deployment/$UI_NAME" "$(k get deploy "$UI_NAME" -o jsonpath='{.spec.template.spec.containers[0].name}')" OSIE_OAUTH2_USER_ACCOUNT_CONSOLE)
   [[ -n $ADMIN_NAME ]] && ADMIN_ACCOUNT=$(container_env "deployment/$ADMIN_NAME" "$(k get deploy "$ADMIN_NAME" -o jsonpath='{.spec.template.spec.containers[0].name}')" OSIE_OAUTH2_USER_ACCOUNT_CONSOLE)
@@ -476,14 +573,25 @@ discover_keycloak_extensions() {
   done < <(k get "$KC_WL" -o go-template='{{range .spec.template.spec.containers}}{{if eq .name "keycloak"}}{{range .volumeMounts}}{{.name}}{{"\t"}}{{.mountPath}}{{"\t"}}{{with .subPath}}{{.}}{{end}}{{"\n"}}{{end}}{{end}}{{end}}')
   KC_INIT_JSON=
   if ((${#KC_KEEP_VOLUMES[@]})); then
-    KC_INIT_JSON=$(k get "$KC_WL" -o jsonpath='{.spec.template.spec.initContainers}')
-    KC_INIT_JSON=${KC_INIT_JSON//"/opt/bitnami/keycloak/"/"/opt/keycloak/"}
-    while read -r vol; do
-      [[ -n $vol ]] && KC_KEEP_VOLUMES+=("$vol")
-    done < <(k get "$KC_WL" -o go-template='{{range .spec.template.spec.initContainers}}{{range .volumeMounts}}{{.name}}{{"\n"}}{{end}}{{end}}')
-    local images
-    images=$(k get "$KC_WL" -o jsonpath='{range .spec.template.spec.initContainers[*]}{.image}{" "}{end}')
-    [[ -n $images ]] && KC_EXT_LINES+=("filled by init container ${images% }")
+    local mounted=" ${KC_KEEP_VOLUMES[*]} " count idx vols v shares keep=() images=()
+    count=$(k get "$KC_WL" -o jsonpath='{range .spec.template.spec.initContainers[*]}{.name}{"\n"}{end}' | awk 'NF' | wc -l)
+    for ((idx = 0; idx < count; idx++)); do
+      vols=$(k get "$KC_WL" -o jsonpath="{range .spec.template.spec.initContainers[$idx].volumeMounts[*]}{.name}{\" \"}{end}")
+      shares=0
+      for v in $vols; do [[ $mounted == *" $v "* ]] && shares=1; done
+      if ((shares)); then
+        json=$(k get "$KC_WL" -o jsonpath="{.spec.template.spec.initContainers[$idx]}")
+        keep+=("${json//"/opt/bitnami/keycloak/"/"/opt/keycloak/"}")
+        for v in $vols; do KC_KEEP_VOLUMES+=("$v"); done
+        images+=("$(k get "$KC_WL" -o jsonpath="{.spec.template.spec.initContainers[$idx].image}")")
+      else
+        warn "Keycloak init container $(k get "$KC_WL" -o jsonpath="{.spec.template.spec.initContainers[$idx].name}") fills no theme or provider, so it is not carried over."
+      fi
+    done
+    if ((${#keep[@]})); then
+      KC_INIT_JSON=$(join_json "${keep[@]}")
+      KC_EXT_LINES+=("filled by init container ${images[*]}")
+    fi
   fi
   mapfile -t KC_KEEP_VOLUMES < <(printf '%s\n' "${KC_KEEP_VOLUMES[@]}" | awk 'NF && !seen[$0]++')
   KC_VOLUMES_JSON=()
@@ -601,13 +709,56 @@ check_render() {
   done
 }
 
+manifest_of_render() { awk '/^MANIFEST:/ { m = 1; next } m && /^NOTES:/ { exit } m' "$1"; }
+
+check_keycloak_release() {
+  step render "Checking that the Keycloak release can hand over its Service and Ingress"
+  mkdir -p "$WORKDIR/chart"
+  if [[ -f $KEYCLOAK_CHART || -d $KEYCLOAK_CHART ]]; then
+    CHART=$KEYCLOAK_CHART
+  else
+    hm pull "$KEYCLOAK_CHART" --version "$CHART_VERSION" -d "$WORKDIR/chart" >/dev/null 2>"$WORKDIR/chart.err" \
+      || die "Could not download chart keycloak $CHART_VERSION from $KEYCLOAK_CHART. Set KEYCLOAK_CHART to it: a .tgz or a folder."
+    CHART=$(ls "$WORKDIR"/chart/keycloak-*.tgz | sed -n 1p)
+  fi
+  KC_KEEP=(--set-string 'service.annotations.helm\.sh/resource-policy=keep')
+  [[ -z $KC_INGRESS ]] || KC_KEEP+=(--set-string 'ingress.annotations.helm\.sh/resource-policy=keep')
+  hm upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values "${KC_KEEP[@]}" "${HM_APPLY[@]}" --dry-run=server >"$WORKDIR/render.txt" 2>"$WORKDIR/render.err" \
+    || { cat "$WORKDIR/render.err" >&2; die "helm cannot render release $RELEASE with chart keycloak $CHART_VERSION."; }
+  local changes
+  changes=$(diff <(hm get manifest "$RELEASE" -n "$NAMESPACE") <(manifest_of_render "$WORKDIR/render.txt") \
+    | grep '^[<>]' | grep -v -E '^> +(annotations:|helm\.sh/resource-policy: keep)$|^[<>] +checksum/[a-z-]+: [0-9a-f]+$' || true)
+  if [[ -n $changes ]]; then
+    sed 's/^/    /' <<<"$changes" | head -20
+    die "Keeping its Service and Ingress would change more of release $RELEASE than that. Nothing was touched."
+  fi
+  ok "$KC_SVC${KC_INGRESS:+ and its Ingress} can be kept when the release is uninstalled"
+}
+
+retire_keycloak_release() {
+  step retire "Uninstalling the Bitnami Keycloak release $RELEASE (its history stays)"
+  undo_push u_helm_rollback "$REVISION"
+  hm upgrade "$RELEASE" "$CHART" -n "$NAMESPACE" --reuse-values "${KC_KEEP[@]}" "${HM_APPLY[@]}" --timeout "$TIMEOUT" >"$WORKDIR/upgrade.txt" 2>&1 \
+    || { tail -20 "$WORKDIR/upgrade.txt" | sed 's/^/    /' >&2; die "helm upgrade of $RELEASE failed."; }
+  u_service "$KC_SVC" "$KC_NEW_SELECTOR" "$KC_NEW_PORTS"
+  hm uninstall "$RELEASE" -n "$NAMESPACE" --keep-history --wait --timeout "$TIMEOUT" >>"$WORKDIR/upgrade.txt" 2>&1 \
+    || { tail -20 "$WORKDIR/upgrade.txt" | sed 's/^/    /' >&2; die "helm uninstall of $RELEASE failed."; }
+  k get svc "$KC_SVC" >/dev/null 2>&1 || die "Service $KC_SVC did not survive the uninstall."
+  [[ -z $KC_INGRESS ]] || k get ingress "$KC_INGRESS" >/dev/null 2>&1 || die "Ingress $KC_INGRESS did not survive the uninstall."
+  local got
+  got=$(kc get --raw "/api/v1/namespaces/$NAMESPACE/services/http:$KC_SVC:http/proxy/realms/${KC_REALMS[0]}/.well-known/openid-configuration" 2>/dev/null || true)
+  [[ $got == *'"issuer"'* ]] || die "$KC_SVC does not reach the new Keycloak after the uninstall."
+  ok "Release $RELEASE is uninstalled, its history kept; $KC_SVC${KC_INGRESS:+ and its Ingress} stay and lead to the new Keycloak (downtime $(( (SECONDS - DOWNTIME_START) / 60 ))m$(( (SECONDS - DOWNTIME_START) % 60 ))s)"
+  checkpoint upgrade
+}
+
 plan_operator() {
   local key=$1 label=$2 crd=$3 where=$4
   if kc get crd "$crd" >/dev/null 2>&1; then
     REUSED_OPERATORS+=("$key")
     OPERATOR_LINES+=("$label: uses the operator already installed; it and its CRD stay untouched")
   else
-    [[ $INSTALL_OPERATORS == 1 ]] || die "No $label operator is installed ($crd is missing). Install it, or run without INSTALL_OPERATORS=0."
+    [[ $INSTALL_OPERATORS == 1 ]] || die "No $label operator is installed ($crd is missing). Install it, or run without --no-install-operators."
     NEED_OPERATORS+=("$key")
     OPERATOR_LINES+=("$label: installs $where")
   fi
@@ -632,6 +783,51 @@ $out"
   return 0
 }
 
+schedulable_nodes() {
+  kc get nodes -o jsonpath='{range .items[*]}{.spec.unschedulable}{" "}{range .spec.taints[*]}{.effect}{","}{end}{"\n"}{end}' 2>/dev/null \
+    | awk '$1 != "true" && $0 !~ /NoSchedule|NoExecute/ { n++ } END { print n + 0 }'
+}
+
+values_render() {
+  local fmt=$1 chart=$WORKDIR/values-chart f args=()
+  shift
+  mkdir -p "$chart/templates"
+  printf 'apiVersion: v2\nname: values\nversion: 0.0.0\n' >"$chart/Chart.yaml"
+  printf '{{ %s .Values }}\n' "$([[ $fmt == json ]] && echo toJson || echo toYaml)" >"$chart/templates/values.yaml"
+  for f; do args+=(-f "$f"); done
+  hm template values "$chart" "${args[@]}" | sed '1,/^# Source: /d'
+}
+
+check_settings() {
+  local pair sc s defaults mine deployed
+  defaults=$(kc get storageclass -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null || true)
+  for pair in "${MONGO_WL:+MongoDB:${MONGO_SC:-}}" "${RABBIT_WL:+RabbitMQ:${RABBIT_SC:-}}" "${KC_WL:+Keycloak database:${PG_SC:-}}"; do
+    [[ -n $pair ]] || continue
+    sc=${pair#*:}
+    if [[ -n $sc ]]; then
+      kc get storageclass "$sc" >/dev/null 2>&1 || die "Storage class '$sc' for the new ${pair%%:*} does not exist. Pick one with --storage-class."
+    else
+      [[ $defaults == *true* ]] || die "The cluster has no default storage class for the new ${pair%%:*}. Pick one with --storage-class."
+    fi
+  done
+  for s in "$MONGODB_SIZE" "$RABBITMQ_SIZE" "$KEYCLOAK_DB_SIZE"; do
+    [[ -z $s || $s =~ ^[1-9][0-9]*(Mi|Gi|Ti)$ ]] || die "Sizes are written like 20Gi; got '$s'."
+  done
+  [[ -z $RABBITMQ_REPLICAS || $RABBITMQ_REPLICAS == 1 || $RABBITMQ_REPLICAS == 3 ]] || die "RABBITMQ_REPLICAS is 1 or 3; got '$RABBITMQ_REPLICAS'."
+  if [[ -n $MONGO_WL && $MONGODB_HA == 1 ]] && (( $(schedulable_nodes) < 3 )); then
+    die "MONGODB_HA=1 puts the three MongoDB members on different nodes, but fewer than 3 nodes take pods."
+  fi
+  [[ -n $VALUES_FILE ]] || return 0
+  [[ -f $VALUES_FILE && -r $VALUES_FILE ]] || die "Cannot read the values file $VALUES_FILE."
+  [[ -w $VALUES_FILE && -w $(dirname "$VALUES_FILE") ]] || die "Cannot write $VALUES_FILE, or a copy of it next to it."
+  VALUES_FILE=$(cd "$(dirname "$VALUES_FILE")" && pwd)/$(basename "$VALUES_FILE")
+  mine=$(values_render json "$VALUES_FILE" 2>"$WORKDIR/values-file.err") \
+    || die "helm cannot read $VALUES_FILE: $(grep -v '^$' "$WORKDIR/values-file.err" | tail -1)"
+  deployed=$(hm get values "$RELEASE" -n "$NAMESPACE" -o json 2>/dev/null || true)
+  [[ $mine == "$deployed" ]] \
+    || warn "$VALUES_FILE differs from the values the release runs with ('helm get values'). The migration's settings are merged into it as it is."
+}
+
 served_within() {
   local kind=$1 name=$2 since=$3
   (( SECONDS - since < 180 )) && return 0
@@ -642,15 +838,15 @@ served_within() {
 show_plan() {
   step plan "Plan"
   [[ -n $CLUSTER_DESC ]] && note "Cluster   $CLUSTER_DESC"
-  note "Release   $RELEASE in $NAMESPACE (chart $CHART_VERSION, revision $REVISION)"
+  note "Release   $RELEASE in $NAMESPACE (chart $CHART_NAME, revision $REVISION)"
   if [[ -n $MONGO_WL ]]; then
-    note "MongoDB   ${MONGO_WL#*/}  →  Percona MongoDB '$MONGODB_NAME', replica set rs0 of 3, $MONGO_TARGET_SIZE each${MONGO_SC:+, class $MONGO_SC}"
+    note "MongoDB   ${MONGO_WL#*/}  →  Percona MongoDB '$MONGODB_NAME', replica set rs0 of 3$([[ $MONGODB_HA == 1 ]] && echo ' on different nodes'), $MONGO_TARGET_SIZE each, class ${MONGO_SC:-default}"
   fi
   if [[ -n $RABBIT_WL ]]; then
-    note "RabbitMQ  $RABBIT_SVC  →  RabbitmqCluster '$RABBITMQ_NAME', $RABBIT_TARGET_SIZE${RABBIT_SC:+, class $RABBIT_SC}"
+    note "RabbitMQ  $RABBIT_SVC  →  RabbitmqCluster '$RABBITMQ_NAME' of $RABBIT_TARGET_REPLICAS, $RABBIT_TARGET_SIZE each, class ${RABBIT_SC:-default}"
   fi
   if [[ -n $KC_WL ]]; then
-    note "Keycloak  $KC_STS  →  Keycloak '$KEYCLOAK_NAME' ${KEYCLOAK_IMAGE:-$KEYCLOAK_OPERATOR_VERSION} on CloudNativePG '$KEYCLOAK_DB_NAME', $PG_TARGET_SIZE${PG_SC:+, class $PG_SC}"
+    note "Keycloak  $KC_STS  →  Keycloak '$KEYCLOAK_NAME' (${KEYCLOAK_IMAGE:-image of the operator}) on CloudNativePG '$KEYCLOAK_DB_NAME', $PG_TARGET_SIZE, class ${PG_SC:-default}"
     note "          same URL $KC_URL, same users, passwords, OTP, keys and realms"
     local l
     for l in "${KC_EXT_LINES[@]}"; do note "          themes/providers: $l"; done
@@ -659,9 +855,21 @@ show_plan() {
   fi
   local o
   for o in "${OPERATOR_LINES[@]}"; do note "Operator  $o"; done
-  note ""
-  note "osie-api is stopped while the data is copied, then started on the new services."
+  if [[ $RELEASE_KIND == keycloak ]]; then
+    note "Release   $RELEASE is uninstalled with its history kept; $KC_SVC${KC_INGRESS:+ and its Ingress} stay and lead to the new Keycloak"
+    note ""
+    note "Keycloak is stopped while its database is copied, then started from the operator."
+  else
+    if [[ -n $VALUES_FILE ]]; then
+      note "Values    $VALUES_FILE gets the migration's settings; a copy of it stays next to it"
+    else
+      note "Values    ./values.migrated.$RELEASE.yaml, to merge into your values file (or pass --values <file>)"
+    fi
+    note ""
+    note "osie-api is stopped while the data is copied, then started on the new services."
+  fi
   note "If a step fails, everything goes back the way it was. Log and files: $WORKDIR"
+  note "Storage class, values file and more: bash migrate.sh --help"
 }
 
 confirm() {
@@ -711,6 +919,16 @@ u_before_helm_rollback() {
 u_helm_rollback() { hm rollback "$RELEASE" "$1" -n "$NAMESPACE" "${HM_APPLY[@]}" --wait --timeout "$TIMEOUT"; }
 u_delete_tripwires() { k delete configmap,secret -l "$MARK=$RELEASE,osie.io/role=tripwire" --ignore-not-found; }
 u_marker() { k delete configmap "$RELEASE-bundled-migration" --ignore-not-found >/dev/null; }
+u_remove() { rm -f "$1"; }
+u_restore_values() {
+  local file=$1 backup=$2 sum=$3
+  [[ -f $backup ]] || return 0
+  if [[ $(cksum <"$file" 2>/dev/null) == "$sum" ]]; then
+    cp -p "$backup" "$file" && rm -f "$backup"
+  else
+    warn "$file changed after the migration, so it was left as it is. Its version from before the migration is $backup."
+  fi
+}
 
 rollback() {
   trap '' INT TERM
@@ -751,7 +969,7 @@ on_exit() {
 
 save_context() {
   {
-    printf 'RELEASE=%q\nNAMESPACE=%q\nREVISION=%q\nMONGODB_NAME=%q\nRABBITMQ_NAME=%q\n' "$RELEASE" "$NAMESPACE" "$REVISION" "$MONGODB_NAME" "$RABBITMQ_NAME"
+    printf 'RELEASE=%q\nRELEASE_KIND=%q\nNAMESPACE=%q\nREVISION=%q\nMONGODB_NAME=%q\nRABBITMQ_NAME=%q\n' "$RELEASE" "$RELEASE_KIND" "$NAMESPACE" "$REVISION" "$MONGODB_NAME" "$RABBITMQ_NAME"
     printf 'KEYCLOAK_NAME=%q\nKEYCLOAK_DB_NAME=%q\nTIMEOUT=%q\n' "$KEYCLOAK_NAME" "$KEYCLOAK_DB_NAME" "$TIMEOUT"
     printf 'KUBECTL=%q\nHELM=%q\nKUBECONFIG_USED=%q\nKUBE_CONTEXT=%q\n' "${KC[*]}" "${HM[*]}" "${KUBECONFIG:-}" "$KUBE_CONTEXT"
     printf 'CLUSTER_ID=%q\nCLUSTER_DESC=%q\n' "$CLUSTER_ID" "$CLUSTER_DESC"
@@ -847,7 +1065,7 @@ metadata:
   labels:
     $MARK: $RELEASE
 spec:
-  image: $PSMDB_IMAGE
+  image: $MONGODB_IMAGE
   secrets:
     users: $MONGODB_NAME-users
   sharding:
@@ -885,7 +1103,8 @@ metadata:
   labels:
     $MARK: $RELEASE
 spec:
-  replicas: $([[ ${RABBIT_REPLICAS:-1} -ge 3 ]] && echo 3 || echo 1)
+  replicas: $RABBIT_TARGET_REPLICAS
+${RABBITMQ_IMAGE:+  image: $RABBITMQ_IMAGE}
   persistence:
     storage: $RABBIT_TARGET_SIZE
 $sc
@@ -955,10 +1174,12 @@ stop_workload() {
 }
 
 stop_writers() {
-  step stop "Stopping osie-api (downtime starts)"
+  step stop "Stopping ${API_NAME:+osie-api and }${KC_WL:+Keycloak }(downtime starts)"
   DOWNTIME_START=$SECONDS
-  stop_workload "statefulset/$API_NAME" "$API_SEL" "$API_REPLICAS"
-  ok "osie-api stopped"
+  if [[ -n $API_NAME ]]; then
+    stop_workload "statefulset/$API_NAME" "$API_SEL" "$API_REPLICAS"
+    ok "osie-api stopped"
+  fi
   if [[ -n $KC_WL ]]; then
     stop_workload "$KC_WL" "$KC_SEL" "$KC_REPLICAS"
     ok "Keycloak stopped"
@@ -1028,7 +1249,7 @@ metadata:
     $MARK: $RELEASE
 spec:
   instances: 1
-  imageName: $CNPG_POSTGRES_IMAGE
+  imageName: $POSTGRES_IMAGE
   storage:
     size: $PG_TARGET_SIZE
 $sc
@@ -1171,6 +1392,7 @@ switch_keycloak_service() {
   local selector ports got
   selector=$(k get svc "$KEYCLOAK_NAME-service" -o jsonpath='{.spec.selector}')
   ports=${KC_SVC_PORTS//\"targetPort\":\"http\"/\"targetPort\":8080}
+  KC_NEW_SELECTOR=$selector KC_NEW_PORTS=$ports
   undo_push u_service "$KC_SVC" "$KC_SVC_SELECTOR" "$KC_SVC_PORTS"
   undo_push u_unkeep svc "$KC_SVC"
   k annotate svc "$KC_SVC" helm.sh/resource-policy=keep --overwrite >/dev/null
@@ -1233,19 +1455,27 @@ start_api() {
 
 tripwires() {
   local sub kind name msg
-  msg="This release moved to operator-managed services on $(date -u +%F). This object makes a helm upgrade that would bring back the bundled services fail, instead of starting OSIE on empty ones. Merge values.migrated.yaml into your values file. To go back on purpose, run: bash migrate.sh rollback"
+  if [[ $RELEASE_KIND == keycloak ]]; then
+    msg="Keycloak release $RELEASE moved to the Keycloak operator on $(date -u +%F). This object makes installing the release again fail, instead of starting the old Keycloak on old data. To go back on purpose, run: bash migrate.sh rollback"
+  else
+    msg="This release moved to operator-managed services on $(date -u +%F). This object makes a helm upgrade that would bring back the bundled services fail, instead of starting OSIE on empty ones. Merge values.migrated.yaml into your values file. To go back on purpose, run: bash migrate.sh rollback"
+  fi
   hm get manifest "$RELEASE" -n "$NAMESPACE" --revision "$REVISION" | awk '
-    /^# Source: / { split($3, p, "/"); sub_ = (p[2] == "charts") ? p[3] : ""; kind = ""; md = 0; next }
+    /^# Source: / { split($3, p, "/"); sub_ = (p[2] == "charts") ? p[3] : "self"; kind = ""; md = 0; next }
     /^kind: / { kind = $2 }
     /^metadata:/ { md = 1; next }
-    md && /^  name: / { gsub(/"/, "", $2); if (sub_ != "" && (kind == "ConfigMap" || kind == "Secret") && !seen[sub_]++) print sub_, kind, $2; md = 0 }
+    md && /^  name: / { gsub(/"/, "", $2); if ((kind == "ConfigMap" || kind == "Secret") && !seen[sub_]++) print sub_, kind, $2; md = 0 }
   ' | while read -r sub kind name; do
-    [[ $sub =~ ^(mongodb|rabbitmq|keycloak|postgresql)$ ]] || continue
-    case $sub in
-      mongodb) [[ -n $MONGO_WL ]] || continue ;;
-      rabbitmq) [[ -n $RABBIT_WL ]] || continue ;;
-      *) [[ -n $KC_WL ]] || continue ;;
-    esac
+    if [[ $RELEASE_KIND == keycloak ]]; then
+      [[ $sub =~ ^(self|postgresql)$ ]] || continue
+    else
+      [[ $sub =~ ^(mongodb|rabbitmq|keycloak|postgresql)$ ]] || continue
+      case $sub in
+        mongodb) [[ -n $MONGO_WL ]] || continue ;;
+        rabbitmq) [[ -n $RABBIT_WL ]] || continue ;;
+        *) [[ -n $KC_WL ]] || continue ;;
+      esac
+    fi
     k get "$kind" "$name" >/dev/null 2>&1 && continue
     if [[ $kind == Secret ]]; then
       k create secret generic "$name" --from-literal=README="$msg" >/dev/null
@@ -1257,20 +1487,101 @@ tripwires() {
   return 0
 }
 
+keycloak_service_manifest() {
+  local type sel ports
+  type=$(k get svc "$KC_SVC" -o jsonpath='{.spec.type}')
+  sel=$(k get svc "$KC_SVC" -o jsonpath='{.spec.selector}')
+  ports=$(k get svc "$KC_SVC" -o jsonpath='{.spec.ports}')
+  printf '{"apiVersion":"v1","kind":"Service","metadata":{"name":%s,"labels":{"%s":%s}},"spec":{"type":%s,"selector":%s,"ports":%s}}\n' \
+    "$(json_str "$KC_SVC")" "$MARK" "$(json_str "$RELEASE")" "$(json_str "${type:-ClusterIP}")" "$sel" "$ports"
+}
+
+keycloak_ingress_manifest() {
+  [[ -n $KC_INGRESS ]] || return 0
+  local ann spec
+  ann=$(k get ingress "$KC_INGRESS" -o jsonpath='{.metadata.annotations}' \
+    | sed -E 's/"(meta\.helm\.sh\/release-name|meta\.helm\.sh\/release-namespace|helm\.sh\/resource-policy|kubectl\.kubernetes\.io\/last-applied-configuration)":"([^"\\]|\\.)*",?//g; s/,}$/}/')
+  spec=$(k get ingress "$KC_INGRESS" -o jsonpath='{.spec}')
+  [[ -n $ann ]] || ann='{}'
+  printf '{"apiVersion":"networking.k8s.io/v1","kind":"Ingress","metadata":{"name":%s,"labels":{"%s":%s},"annotations":%s},"spec":%s}\n' \
+    "$(json_str "$KC_INGRESS")" "$MARK" "$(json_str "$RELEASE")" "$ann" "$spec"
+}
+
+write_manifest() {
+  local file=$PWD/$1 what=$2 fn out
+  shift 2
+  {
+    printf '# %s for %s in namespace %s, on its operator since %s.\n' "$what" "$RELEASE" "$NAMESPACE" "$(date -u +%F)"
+    printf '# The OSIE chart does not deploy it. Keep this file with your deployment and manage it from now on.\n'
+    printf '# Applying it again changes nothing: kubectl apply -n %s -f %s\n' "$NAMESPACE" "$1"
+    for fn; do
+      out=$("$fn")
+      [[ -n $out ]] && printf -- '---\n%s\n' "$out"
+    done
+  } >"$file"
+  k apply --dry-run=server -f "$file" >/dev/null 2>"$WORKDIR/manifest.err" \
+    || warn "$1 does not apply cleanly: $(tail -1 "$WORKDIR/manifest.err")"
+  undo_push u_remove "$file"
+  SERVICE_FILES+=("$file")
+}
+
+write_service_manifests() {
+  SERVICE_FILES=()
+  [[ -z $MONGO_WL ]] || write_manifest "mongodb.$RELEASE.yaml" "MongoDB" psmdb_manifest
+  [[ -z $RABBIT_WL ]] || write_manifest "rabbitmq.$RELEASE.yaml" "RabbitMQ" rabbitmq_manifest
+  [[ -z $KC_WL ]] || write_manifest "keycloak.$RELEASE.yaml" "Keycloak, its theme, database, Service and Ingress," \
+    keycloak_manifest cnpg_manifest keycloak_service_manifest keycloak_ingress_manifest
+  ((${#SERVICE_FILES[@]})) && ok "Wrote ${SERVICE_FILES[*]}"
+  return 0
+}
+
+write_values_file() {
+  [[ -n $VALUES_FILE ]] || return 0
+  local backup merged
+  backup=$VALUES_FILE.before-migration-$(date +%Y%m%d-%H%M%S)
+  merged=$(values_render yaml "$VALUES_FILE" "$VALUES") || die "Could not merge the migration's settings into $VALUES_FILE."
+  cp -p "$VALUES_FILE" "$backup"
+  printf '%s\n' "$merged" >"$VALUES_FILE"
+  undo_push u_restore_values "$VALUES_FILE" "$backup" "$(cksum <"$VALUES_FILE")"
+  ok "$VALUES_FILE now has the migration's settings; the version before is $backup"
+}
+
 commit() {
   step commit "Finishing"
   tripwires
   undo_push u_delete_tripwires
+  write_values_file
+  write_service_manifests
   k patch configmap "$RELEASE-bundled-migration" --type=merge -p "{\"data\":{\"status\":\"migrated\",\"finished\":\"$(date -u +%FT%TZ)\",\"revision\":\"$(current_revision)\"}}" >/dev/null
   COMMITTED=1
+  if [[ $RELEASE_KIND == keycloak ]]; then
+    say ""
+    say "${GREEN}${BOLD}Done.${RESET} Keycloak runs from the Keycloak operator at $KC_URL, with every realm, user and key."
+    say "${BOLD}Keep keycloak.$RELEASE.yaml${RESET} with your deployment and manage it from now on: it declares the new"
+    say "  Keycloak, its theme, database, Service and Ingress. Do not install release $RELEASE again; this run"
+    say "  left objects in $NAMESPACE that make that fail."
+    say ""
+    say "Check by hand: sign in to the applications that use this Keycloak as you usually do."
+    say "Go back (works until cleanup):   bash migrate.sh rollback --workdir $WORKDIR"
+    say "In a week, free the old volumes: bash migrate.sh cleanup --workdir $WORKDIR"
+    return 0
+  fi
   cp "$VALUES" "./values.migrated.$RELEASE.yaml"
   say ""
   say "${GREEN}${BOLD}Done.${RESET} OSIE runs on operator-managed services, with all its data."
   say ""
-  say "${BOLD}Do this now:${RESET} merge ./values.migrated.$RELEASE.yaml into the values file you deploy OSIE with."
-  say "  Without it, your next 'helm upgrade' would ask for the bundled services again. This run left"
+  if [[ -n $VALUES_FILE ]]; then
+    say "${BOLD}From now on${RESET} deploy OSIE with $VALUES_FILE. Helm rewrote it, so comments and key order are gone;"
+    say "  its version from before is next to it. ./values.migrated.$RELEASE.yaml holds just the changes."
+  else
+    say "${BOLD}Do this now:${RESET} merge ./values.migrated.$RELEASE.yaml into the values file you deploy OSIE with,"
+    say "  or run with --values <file> next time to have it done."
+  fi
+  say "  An upgrade without these settings would ask for the bundled services again. This run left"
   say "  objects in $NAMESPACE that make such an upgrade fail, so nothing starts on empty databases."
   say "  The error then names one of them, for example 'PASSWORDS ERROR: The secret \"$RELEASE-mongodb\" ...'."
+  say "${BOLD}Keep $(printf '%s ' "${SERVICE_FILES[@]##*/}")${RESET}with your deployment and manage them from now on."
+  say "  The OSIE chart deploys only OSIE; these declare the services it uses${KC_WL:+, the Keycloak theme included}."
   say ""
   say "Check by hand: sign in to the client portal and the admin as you usually do."
   say "Go back (works until cleanup):   bash migrate.sh rollback --workdir $WORKDIR"
@@ -1352,14 +1663,19 @@ cmd_migrate() {
   exec > >(tee -a "$WORKDIR/migration.log") 2>&1
   save_context
   discover
-  pull_chart
-  write_values
-  check_render
+  if [[ $RELEASE_KIND == keycloak ]]; then
+    check_keycloak_release
+  else
+    pull_chart
+    write_values
+    check_render
+  fi
+  check_settings
   check_operators
   show_plan
   if [[ $COMMAND == plan ]]; then
     say ""
-    ok "Plan only. Nothing was changed. The values it would use: $VALUES"
+    ok "Plan only. Nothing was changed.${VALUES:+ The values it would use: $VALUES}"
     return 0
   fi
   confirm
@@ -1374,9 +1690,13 @@ cmd_migrate() {
   copy_keycloak_db
   start_keycloak
   switch_keycloak_service
-  report_queues
-  helm_upgrade
-  start_api
+  if [[ $RELEASE_KIND == keycloak ]]; then
+    retire_keycloak_release
+  else
+    report_queues
+    helm_upgrade
+    start_api
+  fi
   commit
 }
 

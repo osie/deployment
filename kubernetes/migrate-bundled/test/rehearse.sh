@@ -15,7 +15,9 @@ TARGET_CONTEXT=${TARGET_CONTEXT:-}
 NS=${NS:-osie}
 REL=${REL:-osie}
 HOST=${HOST:-osie.test}
-STORAGE_CLASS=${STORAGE_CLASS:-}
+BUNDLED_STORAGE_CLASS=${BUNDLED_STORAGE_CLASS:-}
+NEW_STORAGE_CLASS=${NEW_STORAGE_CLASS:-}
+unset STORAGE_CLASS
 CLUSTER=osie-mig-$SCENARIO${FAIL_AT:+-$FAIL_AT}${SUFFIX:+-$SUFFIX}
 CLUSTER=${CLUSTER:0:32}
 [[ -z $TARGET_CONTEXT ]] || CLUSTER=remote-$NS
@@ -29,8 +31,12 @@ PASSES=0
 FAILS=0
 
 [[ -n ${OSIE_LICENSE_KEY:-} ]] || { echo "Set OSIE_LICENSE_KEY to a license key for osie-api." >&2; exit 2; }
-[[ $SCENARIO == keycloak || $SCENARIO == local || ($SCENARIO == existing && -n $TARGET_CONTEXT) ]] \
-  || { echo "usage: rehearse.sh keycloak|local [fail-after-step], or TARGET_CONTEXT=<context> rehearse.sh keycloak|local|existing" >&2; exit 2; }
+[[ $SCENARIO == keycloak || $SCENARIO == local || $SCENARIO == standalone || ($SCENARIO == existing && -n $TARGET_CONTEXT) ]] \
+  || { echo "usage: rehearse.sh keycloak|local|standalone [fail-after-step], or TARGET_CONTEXT=<context> rehearse.sh keycloak|local|existing" >&2; exit 2; }
+if [[ $SCENARIO == standalone ]]; then
+  NS=${KC_NS:-auth} REL=${KC_REL:-auth}
+fi
+KC_CHART_VERSION=${KC_CHART_VERSION:-16.1.7}
 
 trap 'echo "rehearse.sh stopped at line $LINENO: $BASH_COMMAND" >&2' ERR
 
@@ -69,6 +75,114 @@ KIND=$CACHE/kind-$KIND_VERSION
 k() { kubectl -n "$NS" "$@"; }
 h() { "$HELM_BIN" "$@"; }
 mig() { HELM="$HELM_BIN" KUBECONFIG=$RUN/kubeconfig.elsewhere bash "$MIGRATE" "$@"; }
+migrate_args() {
+  MIGRATE_ARGS=(--context "$CTX" --release "$REL" --namespace "$NS" --yes)
+  [[ $SCENARIO == standalone ]] || MIGRATE_ARGS+=(--values "$RUN/customer-values.yaml")
+  [[ -z $NEW_STORAGE_CLASS ]] || MIGRATE_ARGS+=(--storage-class "$NEW_STORAGE_CLASS")
+}
+
+install_standalone_keycloak() {
+  say "Bitnami Keycloak $KC_CHART_VERSION as its own release $REL in $NS, with the osie theme"
+  cat >"$RUN/keycloak-values.yaml" <<'EOF'
+image:
+  repository: bitnamilegacy/keycloak
+auth:
+  adminUser: osie_admin
+postgresql:
+  image:
+    repository: bitnamilegacy/postgresql
+keycloakConfigCli:
+  enabled: false
+ingress:
+  enabled: true
+  hostname: auth.osie.test
+  ingressClassName: traefik
+extraEnvVars:
+  - name: KEYCLOAK_PRODUCTION
+    value: "true"
+  - name: KEYCLOAK_PROXY
+    value: "edge"
+initContainers: |-
+  - name: osie-keywind-theme
+    image: ghcr.io/osie-io/osie-keywind:0.1.0-rc1
+    command: [sh, -c, "cp -R /theme/* /keycloak-theme"]
+    volumeMounts:
+      - name: keycloak-theme
+        mountPath: /keycloak-theme
+extraVolumeMounts: |-
+  - name: keycloak-theme
+    mountPath: /opt/bitnami/keycloak/themes/osie
+extraVolumes: |-
+  - name: keycloak-theme
+    emptyDir: {}
+EOF
+  h install "$REL" oci://registry-1.docker.io/bitnamicharts/keycloak --version "$KC_CHART_VERSION" -n "$NS" --create-namespace \
+    -f "$RUN/keycloak-values.yaml" --wait --timeout 15m >/dev/null
+  k get pods
+}
+
+seed_standalone() {
+  say "seed: realm clients with the osie theme, a user with a password and OTP"
+  local at
+  at=$(admin_token)
+  auth -o /dev/null -w '  realm %{http_code}\n' -X POST "$AUTH_URL/admin/realms" -H "Authorization: Bearer $at" -H 'Content-Type: application/json' -d \
+    '{"realm":"clients","enabled":true,"loginTheme":"osie","clients":[{"clientId":"osie-ui","publicClient":true,"directAccessGrantsEnabled":true,"standardFlowEnabled":true,"redirectUris":["http://osie.test/*"]}]}'
+  seed_user "$at"
+  kc_sub >"$RUN/user.sub"
+  [[ -s $RUN/user.sub ]] || { echo "no token for the seeded user" >&2; return 1; }
+  echo "  Keycloak user $(cat "$RUN/user.sub")"
+}
+
+kc_sub() {
+  local r at
+  sleep $(( 31 - $(date +%s) % 30 ))
+  r=$(user_token)
+  at=$(field '["access_token"]' <<<"$r" 2>/dev/null) || return 1
+  python3 -c 'import base64,json,sys; p=sys.argv[1].split(".")[1]; print(json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))["sub"])' "$at"
+}
+
+kc_same_user() { [[ $(kc_sub) == "$(cat "$RUN/user.sub")" ]]; }
+bitnami_keycloak_running() { [[ -n $(k get pod -l "app.kubernetes.io/instance=$REL,app.kubernetes.io/name=keycloak" --field-selector=status.phase=Running -o name) ]]; }
+
+after_success_standalone() {
+  say "after migration"
+  forward
+  check "the Keycloak user signs in with the old password and OTP, and is the same user" kc_same_user
+  check "a wrong OTP is refused" wrong_otp_refused
+  check "the login page uses the osie theme" login_page_has_theme
+  check "the Bitnami release is uninstalled, its history kept" bash -c "[[ \$($HELM_BIN status $REL -n $NS -o json | grep -o '\"status\":\"[a-z-]*\"' | sed -n 1p) == '\"status\":\"uninstalled\"' ]]"
+  check "its Service and Ingress stay" bash -c "kubectl -n $NS get svc $REL-keycloak >/dev/null && kubectl -n $NS get ingress $REL-keycloak >/dev/null"
+  check "keycloak.$REL.yaml applies as it is, theme included" service_files_apply_as_is
+  check "installing the Bitnami release again is refused and changes nothing" bash -c \
+    "! $HELM_BIN upgrade --install $REL oci://registry-1.docker.io/bitnamicharts/keycloak --version $KC_CHART_VERSION -n $NS -f $RUN/keycloak-values.yaml >$RUN/reinstall.log 2>&1 && grep -q -E 'PASSWORDS ERROR|cannot be imported|cannot re-use' $RUN/reinstall.log && [[ -z \$(kubectl -n $NS get sts -l app.kubernetes.io/instance=$REL -o name) ]]"
+}
+
+after_rollback_standalone() {
+  say "after rollback"
+  forward
+  check "the Bitnami release is deployed again" bash -c "[[ \$($HELM_BIN status $REL -n $NS -o json | grep -o '\"status\":\"[a-z-]*\"' | sed -n 1p) == '\"status\":\"deployed\"' ]]"
+  check "the Bitnami Keycloak runs again" bitnami_keycloak_running
+  check "new services and markers are gone" new_services_gone
+  check "operators and their CRDs stay installed" operators_kept
+  check "volume reclaim policies are back" pv_policies_restored
+  check "keycloak.$REL.yaml is removed" service_files_removed
+  check "the Keycloak user still signs in and is the same user" kc_same_user
+  check "the login page uses the osie theme" login_page_has_theme
+}
+
+ensure_storage_class() {
+  [[ -n $NEW_STORAGE_CLASS ]] || return 0
+  kubectl get storageclass "$NEW_STORAGE_CLASS" >/dev/null 2>&1 && return 0
+  kubectl apply -f - >/dev/null <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: $NEW_STORAGE_CLASS
+provisioner: $(kubectl get storageclass standard -o jsonpath='{.provisioner}')
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+EOF
+}
 
 if [[ -n $TARGET_CONTEXT ]]; then
   APP_URL=https://$HOST AUTH_URL=https://auth.$HOST APP_HDR=() AUTH_HDR=()
@@ -111,7 +225,7 @@ install_osie() {
   say "osie $START_CHART with bundled services ($SCENARIO)"
   {
     printf 'global:\n'
-    [[ -z $STORAGE_CLASS ]] || printf '  storageClass: %s\n' "$STORAGE_CLASS"
+    [[ -z $BUNDLED_STORAGE_CLASS ]] || printf '  storageClass: %s\n' "$BUNDLED_STORAGE_CLASS"
     printf '  ingress:\n    enabled: true\n    hostname: %s\n    ingressClassName: traefik\n' "$HOST"
     [[ -z $TARGET_CONTEXT ]] || printf '    tls: true\n    annotations:\n      cert-manager.io/cluster-issuer: letsencrypt\n'
     printf 'license:\n  key: "%s"\n' "$OSIE_LICENSE_KEY"
@@ -154,8 +268,8 @@ new_chart_refuses() {
 
 new_chart_upgrades() {
   say "upgrade to the chart without bundled services"
-  check "the migrated release upgrades to the chart without bundled services" bash -c \
-    "$HELM_BIN upgrade $REL $NEW_CHART -n $NS --reuse-values --wait --timeout 20m >$RUN/new-chart-upgrade.log 2>&1"
+  check "the migrated release upgrades to the chart without bundled services with its values file" bash -c \
+    "$HELM_BIN upgrade $REL $NEW_CHART -n $NS -f $RUN/customer-values.yaml --wait --timeout 20m >$RUN/new-chart-upgrade.log 2>&1"
   check "osie-api healthy on the new chart" wait_api
   if [[ $SCENARIO == keycloak ]]; then
     check "the Keycloak user signs in on the new chart" user_still_signs_in
@@ -180,7 +294,11 @@ after_cleanup() {
   say "migrate.sh cleanup"
   check "cleanup succeeded" bash -c "cd $RUN && HELM=$HELM_BIN KUBECONFIG=$RUN/kubeconfig.elsewhere bash $MIGRATE cleanup --yes >$RUN/cleanup.log 2>&1"
   check "the old volumes are deleted" old_volumes_gone
-  check "osie-api stays healthy" wait_api
+  if [[ $SCENARIO == standalone ]]; then
+    check "the Keycloak user still signs in" kc_same_user
+  else
+    check "osie-api stays healthy" wait_api
+  fi
   check "rollback refuses after cleanup" bash -c \
     "cd $RUN && ! HELM=$HELM_BIN KUBECONFIG=$RUN/kubeconfig.elsewhere bash $MIGRATE rollback --yes >$RUN/rollback-after-cleanup.log 2>&1 && grep -q -E 'Cleanup already deleted|changed after the migration' $RUN/rollback-after-cleanup.log"
 }
@@ -224,17 +342,20 @@ user_token() {
     --data-urlencode "password=$USER_PASSWORD" -d "totp=$code"
 }
 
-seed_keycloak() {
-  say "seed: a Keycloak user with a password and OTP, signed in to OSIE once"
-  local at body token
-  at=$(admin_token)
+seed_user() {
+  local body
   body=$(cat <<EOF
 {"username":"$USER_EMAIL","email":"$USER_EMAIL","emailVerified":true,"enabled":true,"firstName":"Alice","lastName":"Migrate",
  "credentials":[{"type":"password","value":"$USER_PASSWORD","temporary":false},
   {"type":"otp","userLabel":"phone","secretData":"{\"value\":\"$OTP_SECRET\"}","credentialData":"{\"subType\":\"totp\",\"digits\":6,\"counter\":0,\"period\":30,\"algorithm\":\"HmacSHA1\"}"}]}
 EOF
 )
-  auth -o /dev/null -w '%{http_code}\n' -X POST "$AUTH_URL/admin/realms/clients/users" -H "Authorization: Bearer $at" -H 'Content-Type: application/json' -d "$body"
+  auth -o /dev/null -w '  user %{http_code}\n' -X POST "$AUTH_URL/admin/realms/clients/users" -H "Authorization: Bearer $1" -H 'Content-Type: application/json' -d "$body"
+}
+
+seed_keycloak() {
+  say "seed: a Keycloak user with a password and OTP, signed in to OSIE once"
+  seed_user "$(admin_token)"
   sign_in "$RUN/user.before.json" || { echo "no user token" >&2; return 1; }
   user_id "$RUN/user.before.json" >"$RUN/user.id"
   [[ -s $RUN/user.id ]] || { cat "$RUN/user.before.json" >&2; return 1; }
@@ -319,12 +440,16 @@ old_volumes_intact() {
 }
 
 operators_kept() {
-  local crd crds=(perconaservermongodbs.psmdb.percona.com rabbitmqclusters.rabbitmq.com)
-  [[ $SCENARIO != keycloak ]] || crds+=(clusters.postgresql.cnpg.io keycloaks.k8s.keycloak.org)
+  local crd crds=() images
+  [[ $SCENARIO == standalone ]] || crds+=(perconaservermongodbs.psmdb.percona.com rabbitmqclusters.rabbitmq.com)
+  [[ $SCENARIO == local || $SCENARIO == existing ]] || crds+=(clusters.postgresql.cnpg.io keycloaks.k8s.keycloak.org)
   for crd in "${crds[@]}"; do kubectl get crd "$crd" >/dev/null 2>&1 || return 1; done
-  local images
   images=$(kubectl get pods -A --field-selector=status.phase=Running -o jsonpath='{..image}')
-  [[ $images == *percona-server-mongodb-operator:* && $images == */cluster-operator:* ]]
+  if [[ $SCENARIO == standalone ]]; then
+    [[ $images == */cloudnative-pg:* && $images == *keycloak-operator:* ]]
+  else
+    [[ $images == *percona-server-mongodb-operator:* && $images == */cluster-operator:* ]]
+  fi
 }
 
 fake_crd() {
@@ -364,6 +489,44 @@ existing_crd_rules() {
   rm -rf "$RUN"/osie-migration-*
 }
 
+values_file_deploys_as_is() {
+  local out=$RUN/values-file.dryrun
+  "$HELM_BIN" upgrade "$REL" osie --repo https://helm.osie.io --version "$CHART_VERSION" -n "$NS" \
+    -f "$RUN/customer-values.yaml" --dry-run=server >"$out" 2>&1 || return 1
+  diff <(sed -n '/^MANIFEST:/,/^NOTES:/p' "$out" | sed '1d;$d' | grep -v '^# Source:') \
+       <("$HELM_BIN" get manifest "$REL" -n "$NS" | grep -v '^# Source:') >"$RUN/values-file.diff"
+}
+
+service_files() {
+  local f=()
+  [[ $SCENARIO == standalone ]] || f+=("$RUN/mongodb.$REL.yaml" "$RUN/rabbitmq.$REL.yaml")
+  [[ $SCENARIO == local || $SCENARIO == existing ]] || f+=("$RUN/keycloak.$REL.yaml")
+  printf '%s\n' "${f[@]}"
+}
+
+service_files_apply_as_is() {
+  local f out
+  while read -r f; do
+    [[ -f $f ]] || { echo "  missing $f"; return 1; }
+    out=$(kubectl apply -n "$NS" --dry-run=server -f "$f" 2>&1) || { echo "$out" | tail -3; return 1; }
+  done < <(service_files)
+  [[ $SCENARIO == local || $SCENARIO == existing ]] || grep -q osie-keywind "$RUN/keycloak.$REL.yaml"
+}
+
+service_files_removed() {
+  local f
+  while read -r f; do [[ ! -e $f ]] || return 1; done < <(service_files)
+}
+
+values_file_restored() { cmp -s "$RUN/customer-values.yaml" "$RUN/values.yaml" && [[ -z $(ls "$RUN"/customer-values.yaml.before-migration-* 2>/dev/null) ]]; }
+
+new_volumes_use_class() {
+  local want=$1 got
+  got=$(k get pvc -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.storageClassName}{"\n"}{end}' \
+    | awk '$1 ~ /^(mongod-data-mongodb-rs0-|persistence-rabbitmq-server-|keycloak-db-)/ {print $2}' | sort -u)
+  [[ -n $got && $got == "$want" ]]
+}
+
 psmdb_ready() { [[ $(k get psmdb mongodb -o jsonpath='{.status.state}') == ready ]]; }
 bundled_gone() { [[ -z $(k get deploy,sts -l "app.kubernetes.io/instance=$REL" -o name | grep -E 'mongodb|rabbitmq|keycloak|postgresql') ]]; }
 old_pvcs_kept() { [[ -n $(k get pvc -l "app.kubernetes.io/instance=$REL" -o name) ]]; }
@@ -382,12 +545,16 @@ wait_api() {
 }
 
 after_success() {
+  [[ $SCENARIO != standalone ]] || { after_success_standalone; return 0; }
   say "after migration"
   forward
   check "osie-api healthy on the new services" wait_api
   check "operator workloads run" psmdb_ready
   check "bundled workloads are gone" bundled_gone
   check "old volumes are kept" old_pvcs_kept
+  check "an upgrade with the values file passed to --values changes nothing" values_file_deploys_as_is
+  check "the service files apply as they are, the Keycloak theme included" service_files_apply_as_is
+  [[ -z $NEW_STORAGE_CLASS ]] || check "the new volumes use storage class $NEW_STORAGE_CLASS" new_volumes_use_class "$NEW_STORAGE_CLASS"
   if [[ $SCENARIO == keycloak ]]; then
     check "the Keycloak user signs in with the old password and OTP, and is the same OSIE user" user_still_signs_in
     check "a wrong OTP is refused" wrong_otp_refused
@@ -401,12 +568,15 @@ after_success() {
 }
 
 after_rollback() {
+  [[ $SCENARIO != standalone ]] || { after_rollback_standalone; return 0; }
   say "after rollback"
   forward
   check "osie-api healthy again" wait_api
   check "bundled workloads run again" bundled_running
   check "new services and markers are gone" new_services_gone
   check "operators and their CRDs stay installed" operators_kept
+  check "rollback put the values file back" values_file_restored
+  check "rollback removed the service files" service_files_removed
   check "volume reclaim policies are back" pv_policies_restored
   check "the old volumes are bound and not being deleted" old_volumes_intact
   local frozen
@@ -434,7 +604,7 @@ elsewhere_kubeconfig() {
 migrate_again() {
   say "migrate.sh again"
   local rc=0
-  FAIL_AFTER= mig --context "$CTX" --release "$REL" --namespace "$NS" --yes || rc=$?
+  FAIL_AFTER= mig "${MIGRATE_ARGS[@]}" || rc=$?
   check "the second migration succeeded" test "$rc" -eq 0
   ((rc == 0)) && after_success
 }
@@ -448,25 +618,32 @@ main() {
     say "reusing kind cluster $CLUSTER"
   else
     cluster
-    install_osie
+    if [[ $SCENARIO == standalone ]]; then install_standalone_keycloak; else install_osie; fi
   fi
-  local current
-  current=$(release_chart)
-  [[ $(printf '%s\n%s\n' "$current" "$CHART_VERSION" | sort -V | sed -n 1p) == "$CHART_VERSION" ]] || upgrade_first
+  if [[ $SCENARIO != standalone ]]; then
+    local current
+    current=$(release_chart)
+    [[ $(printf '%s\n%s\n' "$current" "$CHART_VERSION" | sort -V | sed -n 1p) == "$CHART_VERSION" ]] || upgrade_first
+  fi
   forward
   case $SCENARIO in
     keycloak) seed_keycloak ;;
     local) seed_local ;;
+    standalone) seed_standalone ;;
   esac
   h get values "$REL" -n "$NS" -o yaml >"$RUN/values.yaml"
-  [[ -z $NEW_CHART ]] || new_chart_refuses
+  cp "$RUN/values.yaml" "$RUN/customer-values.yaml"
+  rm -f "$RUN"/customer-values.yaml.before-migration-*
+  ensure_storage_class
+  migrate_args
+  [[ -z $NEW_CHART || $SCENARIO == standalone ]] || new_chart_refuses
   [[ -n $TARGET_CONTEXT || $SCENARIO != keycloak || -n $FAIL_AT ]] || existing_crd_rules
   mongo_counts >"$RUN/mongo.before"
   say "migrate.sh${FAIL_AT:+ with FAIL_AFTER=$FAIL_AT}"
   cd "$RUN"
   local rc=0
   elsewhere_kubeconfig
-  FAIL_AFTER=$FAIL_AT mig --context "$CTX" --release "$REL" --namespace "$NS" --yes || rc=$?
+  FAIL_AFTER=$FAIL_AT mig "${MIGRATE_ARGS[@]}" || rc=$?
   if [[ -n $FAIL_AT ]]; then
     check "migrate.sh failed as asked" test "$rc" -ne 0
     after_rollback
@@ -486,7 +663,7 @@ main() {
     after_rollback
     if [[ ${AGAIN:-0} == 1 ]]; then
       migrate_again
-      [[ -z $NEW_CHART ]] || new_chart_upgrades
+      [[ -z $NEW_CHART || $SCENARIO == standalone ]] || new_chart_upgrades
       [[ ${CLEANUP:-0} != 1 ]] || after_cleanup
     fi
   fi
