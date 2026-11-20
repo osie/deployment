@@ -22,9 +22,11 @@ release still bundles.
 # 1. A folder for this migration. Keep it: rollback and cleanup run from it.
 mkdir osie-migration && cd osie-migration
 
-# 2. The script, and a copy of the values file you deploy OSIE with
+# 2. The script, and a copy of the values file you deploy OSIE with. It is required.
 curl -fsSLO https://raw.githubusercontent.com/osie/deployment/main/kubernetes/migrate-bundled/migrate.sh
 cp /path/to/your/values.yaml values.yaml
+#    No values file? Write one from what the release runs with:
+#    helm get values <release> -n <namespace> > values.yaml
 
 # 3. What it would do, on which cluster. Nothing changes.
 bash migrate.sh plan --values values.yaml
@@ -78,8 +80,6 @@ KUBECTL="microk8s kubectl" HELM="microk8s helm3" bash migrate.sh plan --values v
 KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash migrate.sh plan --values values.yaml
 ```
 
-Without `--values`, merge `values.migrated.<release>.yaml` into your values file yourself.
-
 ## What it does
 
 1. Checks the release and renders it with the new settings, to confirm that only the services change.
@@ -131,6 +131,7 @@ Applications that use this Keycloak need no change.
 
 | It says | What to do |
 |---|---|
+| Pass --values | Pass the values file you deploy OSIE with. Without one, write it from what the release runs with: `helm get values <release> -n <namespace> > values.yaml` |
 | The release runs a chart older than 26.8.0 | Upgrade OSIE to the latest 26.8 chart the way you usually do, then run it again. Without your values file at hand: `helm upgrade <release> osie --repo https://helm.osie.io --version '~26.8' -n <namespace> --reset-then-reuse-values --wait`, adding `--server-side=false` with helm 4 so changes made with `kubectl edit` do not stop the upgrade halfway |
 | The cluster's CRD refuses what the script would create | The operator already installed is too old for it. Upgrade that operator, then run again |
 | Nothing is handling a new service (no status within 3 minutes) | No operator watches the release's namespace. Start one for it, or add the namespace to the ones it watches, then run again. The script has already put everything back |
@@ -162,7 +163,7 @@ about what cannot be changed once the new services exist.
 | `MONGODB_MEMORY` | `2Gi` | memory limit of each MongoDB member |
 | `KEYCLOAK_URL` | the host of the Keycloak release's Ingress | for a Keycloak installed on its own: the address users reach it at |
 | `KEYCLOAK_CHART` | `oci://registry-1.docker.io/bitnamicharts/keycloak` | for a Keycloak installed on its own: where its chart is, a `.tgz` or a folder without internet |
-| `VALUES_FILE` | none | the same as `--values` |
+| `VALUES_FILE` | none, and required for an OSIE release | the same as `--values` |
 | `KUBECTL`, `HELM` | found by the script | the commands to run |
 | `KUBE_CONTEXT` | the current context | the same as `--context` |
 | `OSIE_CHART` | the chart from `OSIE_CHART_REPO` | the osie chart to upgrade with: a `.tgz`, a folder, `repo/chart` or `oci://…`. It must be the version the release runs |

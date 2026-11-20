@@ -472,16 +472,19 @@ EOF
 }
 
 existing_crd_rules() {
+  check "migrate.sh refuses to start without --values" bash -c \
+    "cd $RUN && ! HELM=$HELM_BIN bash $MIGRATE plan --context $CTX --release $REL --namespace $NS >$RUN/no-values.log 2>&1 && grep -q 'Pass --values' $RUN/no-values.log"
+  rm -rf "$RUN"/osie-migration-*
   say "operators already in the cluster"
   fake_crd rabbitmq.com RabbitmqCluster rabbitmqclusters v1beta1 \
     '{type: object, properties: {spec: {type: object, properties: {replicas: {type: integer}}}}}'
   check "a CRD that refuses what the script creates stops it before any change" bash -c \
-    "cd $RUN && ! HELM=$HELM_BIN bash $MIGRATE plan --context $CTX --release $REL --namespace $NS >$RUN/strict-crd.log 2>&1 && grep -q 'refuses what the script would create' $RUN/strict-crd.log && [[ -z \$(kubectl get ns rabbitmq-system -o name 2>/dev/null) ]]"
+    "cd $RUN && ! HELM=$HELM_BIN bash $MIGRATE plan --context $CTX --release $REL --namespace $NS --values $RUN/customer-values.yaml >$RUN/strict-crd.log 2>&1 && grep -q 'refuses what the script would create' $RUN/strict-crd.log && [[ -z \$(kubectl get ns rabbitmq-system -o name 2>/dev/null) ]]"
   kubectl delete crd rabbitmqclusters.rabbitmq.com --wait >/dev/null
   rm -rf "$RUN"/osie-migration-*
   fake_crd psmdb.percona.com PerconaServerMongoDB perconaservermongodbs v1 '{type: object, x-kubernetes-preserve-unknown-fields: true}'
   check "a CRD with no operator behind it is caught before downtime and rolled back" bash -c \
-    "cd $RUN && ! HELM=$HELM_BIN bash $MIGRATE --context $CTX --release $REL --namespace $NS --yes >$RUN/orphan-crd.log 2>&1 && grep -q 'Nothing is handling psmdb' $RUN/orphan-crd.log && ! grep -q 'downtime starts' $RUN/orphan-crd.log"
+    "cd $RUN && ! HELM=$HELM_BIN bash $MIGRATE --context $CTX --release $REL --namespace $NS --values $RUN/customer-values.yaml --yes >$RUN/orphan-crd.log 2>&1 && grep -q 'Nothing is handling psmdb' $RUN/orphan-crd.log && ! grep -q 'downtime starts' $RUN/orphan-crd.log"
   check "the failed run left nothing behind" bash -c \
     "[[ -z \$(kubectl -n $NS get psmdb,rabbitmqcluster -o name 2>/dev/null) ]] && ! kubectl -n $NS get configmap $REL-bundled-migration >/dev/null 2>&1"
   check "the bundled services kept running" bundled_running

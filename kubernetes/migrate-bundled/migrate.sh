@@ -81,14 +81,14 @@ Moves an OSIE helm release off the bundled Bitnami MongoDB, RabbitMQ and Keycloa
 onto operator-managed services, keeping every user, every theme and all data.
 If any step fails, it puts everything back by itself.
 
-  bash migrate.sh             show the plan, ask, then migrate
-  bash migrate.sh plan        show the plan only, change nothing
-  bash migrate.sh rollback    go back to the bundled services (works until cleanup)
-  bash migrate.sh cleanup     delete the old volumes, once you are happy
+  bash migrate.sh --values <file>         show the plan, ask, then migrate
+  bash migrate.sh plan --values <file>    show the plan only, change nothing
+  bash migrate.sh rollback                go back to the bundled services (works until cleanup)
+  bash migrate.sh cleanup                 delete the old volumes, once you are happy
 
 Options:
-  --values <file>          the values file you deploy OSIE with: the migration's settings are
-                           merged into it, and rollback puts it back as it was
+  --values <file>          required: the values file you deploy OSIE with. The migration's settings
+                           are merged into it, and rollback puts it back as it was
   --storage-class <name>   storage class of the new volumes (by default, that of the old ones)
   --release <name>         the OSIE helm release (found by itself when there is only one)
   --namespace <ns>         its namespace
@@ -817,7 +817,7 @@ check_settings() {
   if [[ -n $MONGO_WL && $MONGODB_HA == 1 ]] && (( $(schedulable_nodes) < 3 )); then
     die "MONGODB_HA=1 puts the three MongoDB members on different nodes, but fewer than 3 nodes take pods."
   fi
-  [[ -n $VALUES_FILE ]] || return 0
+  [[ $RELEASE_KIND == osie ]] || return 0
   [[ -f $VALUES_FILE && -r $VALUES_FILE ]] || die "Cannot read the values file $VALUES_FILE."
   [[ -w $VALUES_FILE && -w $(dirname "$VALUES_FILE") ]] || die "Cannot write $VALUES_FILE, or a copy of it next to it."
   VALUES_FILE=$(cd "$(dirname "$VALUES_FILE")" && pwd)/$(basename "$VALUES_FILE")
@@ -860,11 +860,7 @@ show_plan() {
     note ""
     note "Keycloak is stopped while its database is copied, then started from the operator."
   else
-    if [[ -n $VALUES_FILE ]]; then
-      note "Values    $VALUES_FILE gets the migration's settings; a copy of it stays next to it"
-    else
-      note "Values    ./values.migrated.$RELEASE.yaml, to merge into your values file (or pass --values <file>)"
-    fi
+    note "Values    $VALUES_FILE gets the migration's settings; a copy of it stays next to it"
     note ""
     note "osie-api is stopped while the data is copied, then started on the new services."
   fi
@@ -1536,7 +1532,7 @@ write_service_manifests() {
 }
 
 write_values_file() {
-  [[ -n $VALUES_FILE ]] || return 0
+  [[ $RELEASE_KIND == osie ]] || return 0
   local backup merged
   backup=$VALUES_FILE.before-migration-$(date +%Y%m%d-%H%M%S)
   merged=$(values_render yaml "$VALUES_FILE" "$VALUES") || die "Could not merge the migration's settings into $VALUES_FILE."
@@ -1570,13 +1566,8 @@ commit() {
   say ""
   say "${GREEN}${BOLD}Done.${RESET} OSIE runs on operator-managed services, with all its data."
   say ""
-  if [[ -n $VALUES_FILE ]]; then
-    say "${BOLD}From now on${RESET} deploy OSIE with $VALUES_FILE. Helm rewrote it, so comments and key order are gone;"
-    say "  its version from before is next to it. ./values.migrated.$RELEASE.yaml holds just the changes."
-  else
-    say "${BOLD}Do this now:${RESET} merge ./values.migrated.$RELEASE.yaml into the values file you deploy OSIE with,"
-    say "  or run with --values <file> next time to have it done."
-  fi
+  say "${BOLD}From now on${RESET} deploy OSIE with $VALUES_FILE. Helm rewrote it, so comments and key order are gone;"
+  say "  its version from before is next to it. ./values.migrated.$RELEASE.yaml holds just the changes."
   say "  An upgrade without these settings would ask for the bundled services again. This run left"
   say "  objects in $NAMESPACE that make such an upgrade fail, so nothing starts on empty databases."
   say "  The error then names one of them, for example 'PASSWORDS ERROR: The secret \"$RELEASE-mongodb\" ...'."
@@ -1663,6 +1654,8 @@ cmd_migrate() {
   exec > >(tee -a "$WORKDIR/migration.log") 2>&1
   save_context
   discover
+  [[ $RELEASE_KIND == keycloak || -n $VALUES_FILE ]] \
+    || die "Pass --values <file>: the values file you deploy OSIE with. The migration's settings are merged into it. Without one, write it from what the release runs with: helm get values $RELEASE -n $NAMESPACE > values.yaml"
   if [[ $RELEASE_KIND == keycloak ]]; then
     check_keycloak_release
   else
