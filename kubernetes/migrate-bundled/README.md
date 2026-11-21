@@ -2,7 +2,8 @@
 
 Older installs of the `osie` helm chart run MongoDB, RabbitMQ and Keycloak from Bitnami subcharts, which
 the chart turned on by default. Bitnami no longer publishes those images, so they get no fixes, and the
-chart from 26.9 on no longer includes them: it deploys only OSIE. `migrate.sh` moves a release onto
+chart from 26.8.3 on no longer includes them: it deploys only OSIE, and refuses to upgrade a release that
+still runs them. `migrate.sh` moves a release onto
 operator-managed services in one maintenance window, keeping all data:
 
 | Bundled | Becomes |
@@ -55,7 +56,7 @@ Then:
 6. If something is wrong, go back: `bash migrate.sh rollback`. This works until you clean up or upgrade the
    release again, and loses whatever was written to OSIE since the migration.
 7. Once you are confident, free the old volumes: `bash migrate.sh cleanup`.
-8. Upgrade to OSIE 26.9 or later with your new `values.yaml`.
+8. Upgrade to chart 26.8.3 or later with your new `values.yaml`.
 
 `bash migrate.sh --help` lists every option.
 
@@ -65,12 +66,14 @@ You need:
 
 - bash 4.4 or later (on macOS, `brew install bash`), and cluster-admin rights through the same kubeconfig
   for `kubectl` and `helm` (helm 3.14 or later, or 4)
-- the release on chart 26.8 or later (see *When it stops before starting*)
+- the release on chart 26.8.0, 26.8.1 or 26.8.2, the last charts with the bundled services (see *When it
+  stops before starting*)
 - room in the cluster for the new copies while the old volumes are kept: the new MongoDB has three members,
   each with a full copy, so plan for three times its data, plus a copy of RabbitMQ's and Keycloak's
 - internet access for the operators and the chart, unless they are installed already
 - a maintenance window: osie-api is stopped from the start of the copy until it runs on the new services.
-  For a few gigabytes of data this takes minutes.
+  Plan for about 3 minutes plus half a minute per gigabyte of MongoDB data: 20 GB took 12 minutes in a
+  test. The plan shows how much data there is.
 
 It works on the current context of your kubeconfig, and the plan names that cluster before anything
 changes. Pass `--context <name>` for another one. It finds the OSIE release by itself; with several, pass
@@ -113,7 +116,7 @@ more, so the old volumes keep their data; fix what it reports and run `bash migr
 An upgrade without the new settings would ask for the bundled services again, so the script leaves small
 objects in the namespace that make such an upgrade fail before it changes anything. The error names one of
 them, for example `PASSWORDS ERROR: The secret "osie-mongodb" does not contain the key …`. Keep them until
-you are on chart 26.9 or later.
+you are on chart 26.8.3 or later.
 
 `rollback` and `cleanup` work from the folder you ran the migration in, or take `--workdir <folder>`. They use
 the context the migration used, and refuse to run against any other cluster.
@@ -141,7 +144,8 @@ Applications that use this Keycloak need no change.
 | It says | What to do |
 |---|---|
 | Pass --values | Pass the values file you deploy OSIE with. Without one, write it from what the release runs with: `helm get values <release> -n <namespace> > values.yaml` |
-| The release runs a chart older than 26.8.0 | Upgrade OSIE to the latest 26.8 chart the way you usually do, then run it again. Without your values file at hand: `helm upgrade <release> osie --repo https://helm.osie.io --version '~26.8' -n <namespace> --reset-then-reuse-values --wait`, adding `--server-side=false` with helm 4 so changes made with `kubectl edit` do not stop the upgrade halfway |
+| The release runs a chart older than 26.8.0 | Upgrade OSIE to chart 26.8.2 exactly, the last one with the bundled services, then run it again. Later charts refuse the upgrade. Without your values file at hand: `helm upgrade <release> osie --repo https://helm.osie.io --version 26.8.2 -n <namespace> --reset-then-reuse-values --wait`, adding `--server-side=false` with helm 4 so changes made with `kubectl edit` do not stop the upgrade halfway |
+| The release runs chart 26.8.3 or later | That chart deploys no bundled services, so there is nothing to move |
 | The cluster's CRD refuses what the script would create | The operator already installed is too old for it. Upgrade that operator, then run again |
 | Nothing is handling a new service (no status within 3 minutes) | No operator watches the release's namespace. Start one for it, or add the namespace to the ones it watches, then run again. The script has already put everything back |
 | A storage class does not exist, or there is no default one | Pick one with `--storage-class`, or per service with the variables under *Settings* |
@@ -169,7 +173,7 @@ about what cannot be changed once the new services exist.
 | `RABBITMQ_REPLICAS` | `3` when the bundled RabbitMQ had 3 or more, else `1` | RabbitMQ nodes, `1` or `3` |
 | `MONGODB_IMAGE`, `POSTGRES_IMAGE` | `percona/percona-server-mongodb:7.0.18-11`, `ghcr.io/cloudnative-pg/postgresql:17` | images of the new MongoDB and Keycloak database, for clusters that pull from a mirror |
 | `RABBITMQ_IMAGE`, `KEYCLOAK_IMAGE` | the image of the operator | images of the new RabbitMQ and Keycloak, for clusters that pull from a mirror. Themes come from volumes and init containers, never from the image |
-| `MONGODB_NAME`, `RABBITMQ_NAME`, `KEYCLOAK_NAME`, `KEYCLOAK_DB_NAME` | `mongodb`, `rabbitmq`, `keycloak`, `keycloak-db` | names of the new services |
+| `MONGODB_NAME`, `RABBITMQ_NAME`, `KEYCLOAK_NAME`, `KEYCLOAK_DB_NAME` | `mongodb`, `rabbitmq`, `keycloak`, `keycloak-db` | names of the new services. When the Keycloak being moved is itself called `keycloak`, the new one is `keycloak-server` |
 | `MONGODB_MEMORY` | `2Gi` | memory limit of each MongoDB member |
 | `KEYCLOAK_URL` | the host of the Keycloak release's Ingress | for a Keycloak installed on its own: the address users reach it at |
 | `KEYCLOAK_CHART` | `oci://registry-1.docker.io/bitnamicharts/keycloak` | for a Keycloak installed on its own: where its chart is, a `.tgz` or a folder without internet |

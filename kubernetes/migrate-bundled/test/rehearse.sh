@@ -37,6 +37,8 @@ if [[ $SCENARIO == standalone ]]; then
   NS=${KC_NS:-auth} REL=${KC_REL:-auth}
 fi
 KC_CHART_VERSION=${KC_CHART_VERSION:-16.1.7}
+KC_FULL=$REL-keycloak
+[[ $REL != *keycloak* ]] || KC_FULL=$REL
 
 trap 'echo "rehearse.sh stopped at line $LINENO: $BASH_COMMAND" >&2' ERR
 
@@ -156,7 +158,7 @@ after_success_standalone() {
   check "a wrong OTP is refused" wrong_otp_refused
   check "the login page uses the osie theme" login_page_has_theme
   check "the Bitnami release is uninstalled, its history kept" bash -c "[[ \$($HELM_BIN status $REL -n $NS -o json | grep -o '\"status\":\"[a-z-]*\"' | sed -n 1p) == '\"status\":\"uninstalled\"' ]]"
-  check "its Service and Ingress stay" bash -c "kubectl -n $NS get svc $REL-keycloak >/dev/null && kubectl -n $NS get ingress $REL-keycloak >/dev/null"
+  check "its Service and Ingress stay" bash -c "kubectl -n $NS get svc $KC_FULL >/dev/null && kubectl -n $NS get ingress $KC_FULL >/dev/null"
   check "keycloak.$REL.yaml applies as it is, theme included" service_files_apply_as_is
   check "installing the Bitnami release again is refused and changes nothing" bash -c \
     "! $HELM_BIN upgrade --install $REL oci://registry-1.docker.io/bitnamicharts/keycloak --version $KC_CHART_VERSION -n $NS -f $RUN/keycloak-values.yaml >$RUN/reinstall.log 2>&1 && grep -q -E 'PASSWORDS ERROR|cannot be imported|cannot re-use' $RUN/reinstall.log && [[ -z \$(kubectl -n $NS get sts -l app.kubernetes.io/instance=$REL -o name) ]]"
@@ -244,6 +246,7 @@ install_osie() {
     printf 'license:\n  key: "%s"\n' "$OSIE_LICENSE_KEY"
     [[ $SCENARIO != local ]] || printf 'keycloak:\n  enabled: false\n'
     [[ ${BUNDLED_HA:-0} != 1 ]] || printf 'mongodb:\n  architecture: replicaset\n  replicaCount: 3\nrabbitmq:\n  replicaCount: 3\n'
+    [[ -z ${BIG_DATA_GB:-} ]] || printf 'mongodb:\n  persistence:\n    size: %sGi\n' $((BIG_DATA_GB * 2))
     [[ ${EXTRA_THEME:-0} != 1 ]] || cat <<'EOF'
 keycloak:
   initContainers: |-
@@ -320,6 +323,8 @@ new_chart_upgrades() {
   else
     check "onboarding stays done on the new chart" onboarding_done
   fi
+  check "migrate.sh finds nothing to move on the new chart" bash -c \
+    "cd $RUN && ! HELM=$HELM_BIN bash $MIGRATE plan --context $CTX --release $REL --namespace $NS --values $RUN/customer-values.yaml >$RUN/new-chart-plan.log 2>&1 && grep -q 'nothing to move' $RUN/new-chart-plan.log"
   check "rollback refuses once the release moved on" bash -c \
     "cd $RUN && ! HELM=$HELM_BIN KUBECONFIG=$RUN/kubeconfig.elsewhere bash $MIGRATE rollback --yes >$RUN/rollback-moved-on.log 2>&1 && grep -q 'changed after the migration' $RUN/rollback-moved-on.log"
 }
@@ -372,7 +377,7 @@ field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval("d"+sy
 
 admin_token() {
   local pw
-  pw=$(k get secret "$REL-keycloak" -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d)
+  pw=$(k get secret "$KC_FULL" -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d)
   [[ -n $pw ]] || pw=$(cat "$RUN/kc-admin-password")
   printf '%s' "$pw" >"$RUN/kc-admin-password"
   auth -X POST "$AUTH_URL/realms/master/protocol/openid-connect/token" \
@@ -657,6 +662,29 @@ after_rollback() {
   fi
 }
 
+seed_bulk() {
+  say "seed: $BIG_DATA_GB GB of documents in the bundled MongoDB"
+  local pw start
+  pw=$(k get secret "$REL-mongodb" -o jsonpath='{.data.mongodb-root-password}' | base64 -d)
+  start=$(date +%s)
+  k exec "deploy/$REL-mongodb" -- env PW="$pw" GB="$BIG_DATA_GB" bash -c '
+    for w in $(seq 16); do
+      mongosh --quiet -u root -p "$PW" --authenticationDatabase admin osie --eval "
+        const W = $w, MB = $GB * 1024 / 16;
+        const pool = [...Array(256)].map(() => { let s = \"\"; while (s.length < 4096) s += Math.random().toString(36).slice(2); return s.slice(0, 4096); });
+        const batches = Math.ceil(MB * 1024 * 1024 / 4200 / 1000);
+        for (let b = 0; b < batches; b++) {
+          const docs = [];
+          for (let i = 0; i < 1000; i++) docs.push({w: W, b, i, p: pool[(b * 7 + i) % 256], t: new Date()});
+          db.bulk.insertMany(docs, {ordered: false, writeConcern: {w: 1}});
+        }" &
+    done
+    wait'
+  k exec "deploy/$REL-mongodb" -- mongosh --quiet -u root -p "$pw" --authenticationDatabase admin osie \
+    --eval 'const s = db.stats(1024 * 1024 * 1024); print("data " + s.dataSize.toFixed(1) + " GB, on disk " + s.storageSize.toFixed(1) + " GB, " + db.bulk.estimatedDocumentCount() + " documents")'
+  echo "  seeded in $(( $(date +%s) - start ))s"
+}
+
 pause_new_mongodb_at_upgrade() {
   local log
   for _ in $(seq 1800); do
@@ -724,6 +752,7 @@ main() {
     local) seed_local ;;
     standalone) seed_standalone ;;
   esac
+  [[ -z ${BIG_DATA_GB:-} ]] || seed_bulk
   h get values "$REL" -n "$NS" -o yaml >"$RUN/values.yaml"
   cp "$RUN/values.yaml" "$RUN/customer-values.yaml"
   rm -f "$RUN"/customer-values.yaml.before-migration-* "$RUN"/mongodb.*.yaml "$RUN"/rabbitmq.*.yaml "$RUN"/keycloak.*.yaml

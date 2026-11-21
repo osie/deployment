@@ -9,6 +9,8 @@ RABBITMQ_OPERATOR_VERSION=v2.21.0
 CNPG_VERSION=1.30.2
 KEYCLOAK_OPERATOR_VERSION=26.8.2
 MIN_CHART_VERSION=26.8.0
+LAST_BUNDLED_CHART=26.8.2
+FIRST_UNBUNDLED_CHART=26.8.3
 
 RELEASE=${RELEASE:-}
 NAMESPACE=${NAMESPACE:-}
@@ -36,6 +38,7 @@ VALUES_FILE=${VALUES_FILE:-}
 KEYCLOAK_URL=${KEYCLOAK_URL:-}
 KEYCLOAK_CHART=${KEYCLOAK_CHART:-oci://registry-1.docker.io/bitnamicharts/keycloak}
 RABBITMQ_NAME=${RABBITMQ_NAME:-rabbitmq}
+KEYCLOAK_NAME_SET=${KEYCLOAK_NAME:+1}
 KEYCLOAK_NAME=${KEYCLOAK_NAME:-keycloak}
 KEYCLOAK_DB_NAME=${KEYCLOAK_DB_NAME:-keycloak-db}
 ALLOW_RABBITMQ_CLIENTS=${ALLOW_RABBITMQ_CLIENTS:-0}
@@ -266,8 +269,12 @@ find_release() {
   IFS=$'\t' read -r RELEASE NAMESPACE CHART_NAME RELEASE_STATUS REVISION <<<"${rows[0]}"
   RELEASE_KIND=${CHART_NAME%%-[0-9]*}
   CHART_VERSION=${CHART_NAME#"$RELEASE_KIND"-}
-  [[ $RELEASE_KIND == keycloak ]] || version_ge "$CHART_VERSION" "$MIN_CHART_VERSION" \
-    || die "Release $RELEASE runs chart $CHART_VERSION. Upgrade OSIE to chart $MIN_CHART_VERSION or later the way you usually do, then run this again. README.md shows a command for it."
+  if [[ $RELEASE_KIND == osie ]]; then
+    version_ge "$CHART_VERSION" "$MIN_CHART_VERSION" \
+      || die "Release $RELEASE runs chart $CHART_VERSION. Upgrade OSIE to chart $LAST_BUNDLED_CHART, the last one with the bundled services, then run this again. README.md shows a command for it."
+    ! version_ge "$CHART_VERSION" "$FIRST_UNBUNDLED_CHART" \
+      || die "Release $RELEASE runs chart $CHART_VERSION, which deploys no bundled services, so there is nothing to move."
+  fi
   [[ $RELEASE_KIND == osie || -z $VALUES_FILE ]] || die "--values is for OSIE releases; $RELEASE is a Keycloak release."
   [[ $RELEASE_STATUS == deployed ]] || die "Release $RELEASE is '$RELEASE_STATUS'. Bring it back to 'deployed' first (helm rollback or a fixed upgrade)."
   k get secret "sh.helm.release.v1.$RELEASE.v$REVISION" >/dev/null 2>&1 \
@@ -479,6 +486,10 @@ discover_rabbitmq() {
 
 discover_keycloak() {
   KC_STS=${KC_WL#*/}
+  if [[ $KC_STS == "$KEYCLOAK_NAME" ]]; then
+    [[ -z $KEYCLOAK_NAME_SET ]] || die "KEYCLOAK_NAME=$KEYCLOAK_NAME is the name of the Keycloak being moved. Pick another one."
+    KEYCLOAK_NAME=$KEYCLOAK_NAME-server
+  fi
   KC_SEL=$(selector_of "$KC_WL")
   KC_REPLICAS=$(k get "$KC_WL" -o jsonpath='{.spec.replicas}')
   [[ $KC_REPLICAS =~ ^[1-9] ]] || KC_REPLICAS=1
@@ -490,7 +501,7 @@ discover_keycloak() {
     printf '%s' "$v"
   }
   KC_IMAGE_OLD=$(k get "$KC_WL" -o go-template='{{range .spec.template.spec.containers}}{{if eq .name "keycloak"}}{{.image}}{{end}}{{end}}')
-  if [[ ! $KC_IMAGE_OLD =~ (^|/)bitnami(legacy)?/keycloak[:@] ]]; then
+  if [[ ! $KC_IMAGE_OLD =~ (^|/)bitnami(legacy)?/keycloak[:@] && ! $KC_IMAGE_OLD =~ /keycloak:[0-9.]+-debian-[0-9]+-r[0-9]+$ ]]; then
     die "Keycloak runs its own image ($KC_IMAGE_OLD). Themes and providers built into an image are not supported: provide them as a volume or an init container in the Keycloak values, deploy that, then run this again."
   fi
   local rel_path
@@ -866,7 +877,7 @@ keycloak_operator_serves() {
   local name=$KEYCLOAK_NAME-probe t0=$SECONDS served=
   printf '{"apiVersion":"%s","kind":"Keycloak","metadata":{"name":"%s","labels":{"%s":%s}},"spec":{"instances":0,"hostname":{"hostname":"https://probe.invalid"},"http":{"httpEnabled":true},"db":{"vendor":"postgres","host":"none"}}}\n' \
     "$(keycloak_api_version)" "$name" "$MARK" "$(json_str "$RELEASE")" | k apply -f - >/dev/null
-  until [[ -n $served ]] || (( SECONDS - t0 > 30 )); do
+  until [[ -n $served ]] || (( SECONDS - t0 > 90 )); do
     sleep 3
     served=$(k get keycloak "$name" -o jsonpath='{.status}' 2>/dev/null || true)
   done
@@ -931,7 +942,8 @@ u_delete() {
     k delete "$1" "$2" --ignore-not-found --wait=true --timeout=10m
     sleep 5
   done
-  [[ -z $(k get "$1" "$2" -o name 2>/dev/null) ]] || { warn "$1 '$2' was created again by its operator after each delete; delete it by hand."; return 1; }
+  [[ -z $(k get "$1" "$2" -o name 2>/dev/null) ]] || warn "$1 '$2' was created again by its operator after each delete; delete it by hand. The old services do not need it."
+  return 0
 }
 u_delete_pvcs() {
   local pvc
@@ -968,22 +980,46 @@ u_before_helm_rollback() {
     k delete ingress "$ing" --ignore-not-found --wait=true >/dev/null || return 1
   fi
   if [[ -n $pvc ]] && ! in_release_manifest "$manifest" PersistentVolumeClaim "$pvc" && k get pvc "$pvc" >/dev/null 2>&1; then
+    local have want
     pv=$(k get pvc "$pvc" -o jsonpath='{.spec.volumeName}')
+    [[ -n $pv ]] || return 1
+    have=$(kc get pv "$pv" -o jsonpath='{.spec.storageClassName}')
+    want=$(claim_class_after_rollback "$pvc") || return 1
+    if [[ $want != "$have" ]]; then
+      warn "Helm would recreate $pvc with storage class '${want}', but its volume $pv is of class '${have}', so it would get a new empty volume. Make '${have}' the default storage class again, then run rollback."
+      return 1
+    fi
     k delete pvc "$pvc" --wait=true --timeout=5m >/dev/null || return 1
     kc patch pv "$pv" -p '{"spec":{"claimRef":{"uid":null,"resourceVersion":null}}}' >/dev/null || return 1
   fi
   return 0
 }
+
+claim_class_after_rollback() {
+  local set
+  set=$(hm get manifest "$RELEASE" -n "$NAMESPACE" --revision "$REVISION" | awk -v n="$1" '
+    /^---/ { kind = ""; name = "" }
+    /^kind: / { kind = $2 }
+    /^  name: / { gsub(/"/, "", $2); name = $2 }
+    kind == "PersistentVolumeClaim" && name == n && /^  storageClassName:/ { v = $2; gsub(/"/, "", v); print "set " v; exit }')
+  if [[ -n $set ]]; then
+    printf '%s' "${set#set }"
+  else
+    kc get storageclass -o jsonpath='{range .items[*]}{.metadata.creationTimestamp}{" "}{.metadata.name}{" "}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' \
+      | awk '$3 == "true"' | sort | awk 'END { print $2 }'
+  fi
+}
 u_helm_rollback() {
-  local since p wl
-  since=$(date -u +%FT%TZ)
+  local before p wls wl
+  before=$(k get pod -l "app.kubernetes.io/instance=$RELEASE" -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' 2>/dev/null || true)
   hm rollback "$RELEASE" "$1" -n "$NAMESPACE" "${HM_APPLY[@]}" --timeout "$TIMEOUT" || return 1
   # A StatefulSet keeps a pod that never became ready on the old template; delete those so they come back
-  for p in $(k get pod -l "app.kubernetes.io/instance=$RELEASE" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.creationTimestamp}{" "}{.status.containerStatuses[*].ready}{"\n"}{end}' 2>/dev/null \
-      | awk -v s="$since" '$2 < s && $0 !~ / true( |$)/ {print $1}'); do
+  for p in $(k get pod -l "app.kubernetes.io/instance=$RELEASE" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.uid}{" "}{.status.containerStatuses[*].ready}{"\n"}{end}' 2>/dev/null \
+      | awk -v before="$before" 'BEGIN { n = split(before, u, "\n"); for (i = 1; i <= n; i++) old[u[i]] = 1 } ($2 in old) && (NF < 3 || $0 ~ / false( |$)/) {print $1}'); do
     k delete pod "$p" --wait=false >/dev/null || true
   done
-  for wl in $(k get deploy,sts -l "app.kubernetes.io/instance=$RELEASE" -o name); do
+  wls=$(k get deploy,sts -l "app.kubernetes.io/instance=$RELEASE" -o name) || return 1
+  for wl in $wls; do
     k rollout status "$wl" --timeout="$TIMEOUT" >/dev/null || { warn "$wl did not come back."; return 1; }
   done
 }
@@ -1004,6 +1040,7 @@ rollback() {
   trap '' INT TERM HUP
   [[ -s $WORKDIR/undo ]] || { ok "Nothing to undo."; return 0; }
   step rollback "Putting everything back"
+  k patch configmap "$RELEASE-bundled-migration" --type=merge -p '{"data":{"status":"rolling-back"}}' >/dev/null 2>&1 || true
   local lines=() i
   mapfile -t lines <"$WORKDIR/undo"
   for ((i = ${#lines[@]} - 1; i >= 0; i--)); do
@@ -1027,6 +1064,7 @@ rollback() {
 
 on_exit() {
   local rc=$?
+  trap '' INT TERM HUP
   trap - EXIT
   if ((rc != 0 && MUTATED == 1 && COMMITTED == 0)) && [[ $COMMAND == migrate ]]; then
     printf '\n%sFailed during step: %s%s\n' "$RED" "$CURRENT_STEP" "$RESET" >&2
@@ -1072,17 +1110,13 @@ start_marker() {
     die "Release $RELEASE has a migration marked '$existing' (ConfigMap $RELEASE-bundled-migration). If a previous run crashed, run 'bash migrate.sh rollback' from where it ran."
   fi
   MUTATED=1
+  undo_push u_marker
   k create configmap "$RELEASE-bundled-migration" --from-literal=status=running \
     --from-literal=started="$(date -u +%FT%TZ)" --from-literal=host="$(hostname)" --from-literal=workdir="$WORKDIR" >/dev/null
   k label configmap "$RELEASE-bundled-migration" "$MARK=$RELEASE" >/dev/null
-  undo_push u_marker
 }
 
 install_operators() {
-  if ((KC_PROBE)) && ! keycloak_operator_serves; then
-    note "No Keycloak operator serves namespace $NAMESPACE; installing one there"
-    NEED_OPERATORS+=(keycloak)
-  fi
   ((${#NEED_OPERATORS[@]})) || return 0
   step operators "Installing operators"
   local o
@@ -1631,19 +1665,22 @@ write_service_manifests() {
 
 write_values_file() {
   [[ $RELEASE_KIND == osie ]] || return 0
-  local backup merged
+  local backup merged tmp
   backup=$VALUES_FILE.before-migration-$(date +%Y%m%d-%H%M%S)
+  tmp=$VALUES_FILE.migrating-$$
   merged=$(values_render yaml "$VALUES_FILE" "$VALUES") || die "Could not merge the migration's settings into $VALUES_FILE."
   cp -p "$VALUES_FILE" "$backup"
-  printf '%s\n' "$merged" >"$VALUES_FILE"
-  undo_push u_restore_values "$VALUES_FILE" "$backup" "$(cksum <"$VALUES_FILE")"
+  undo_push u_restore_values "$VALUES_FILE" "$backup" "$(printf '%s\n' "$merged" | cksum)"
+  cp -p "$VALUES_FILE" "$tmp"
+  printf '%s\n' "$merged" >"$tmp"
+  mv -f "$tmp" "$VALUES_FILE"
   ok "$VALUES_FILE now has the migration's settings; the version before is $backup"
 }
 
 commit() {
   step commit "Finishing"
-  tripwires
   undo_push u_delete_tripwires
+  tripwires
   write_values_file
   write_service_manifests
   k patch configmap "$RELEASE-bundled-migration" --type=merge -p "{\"data\":{\"status\":\"migrated\",\"finished\":\"$(date -u +%FT%TZ)\",\"revision\":\"$(current_revision)\"}}" >/dev/null
@@ -1714,12 +1751,15 @@ cmd_rollback() {
   load_context
   check_marker_workdir
   say "Rolling back the migration of $RELEASE in $NAMESPACE (work folder $WORKDIR)."
-  [[ $(cm_value "$RELEASE-bundled-migration" status) == cleaned ]] && die "Cleanup already deleted the old volumes; there is nothing to go back to."
-  local left now
-  left=$(cm_value "$RELEASE-bundled-migration" revision)
-  now=$(current_revision)
-  [[ -z $left || $left == "$now" ]] \
-    || die "Release $RELEASE changed after the migration (revision $now; the migration left revision $left), for example by an upgrade to a newer chart. Going back would undo that as well, so nothing was changed."
+  local status left now
+  status=$(cm_value "$RELEASE-bundled-migration" status)
+  [[ $status == cleaned ]] && die "Cleanup already deleted the old volumes; there is nothing to go back to."
+  if [[ $status != rolling-back ]]; then
+    left=$(cm_value "$RELEASE-bundled-migration" revision)
+    now=$(current_revision)
+    [[ -z $left || $left == "$now" ]] \
+      || die "Release $RELEASE changed after the migration (revision $now; the migration left revision $left), for example by an upgrade to a newer chart. Going back would undo that as well, so nothing was changed."
+  fi
   if [[ $ASSUME_YES != 1 ]]; then
     [[ -t 0 ]] || die "Not asking without a terminal. Run with --yes."
     local a
@@ -1732,7 +1772,11 @@ cmd_rollback() {
 cmd_cleanup() {
   load_context
   check_marker_workdir
-  [[ $(cm_value "$RELEASE-bundled-migration" status) == migrated ]] || die "Release $RELEASE has no finished migration to clean up."
+  case $(cm_value "$RELEASE-bundled-migration" status) in
+    migrated) ;;
+    rolling-back|running) die "Going back from the migration of $RELEASE did not finish, so its old volumes are still needed. Run: bash migrate.sh rollback --workdir $WORKDIR" ;;
+    *) die "Release $RELEASE has no finished migration to clean up." ;;
+  esac
   local pvcs pvc pv
   pvcs=$(k get pvc -l "app.kubernetes.io/instance=$RELEASE" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.labels.app\.kubernetes\.io/name}{"\n"}{end}' | awk '$2 ~ /^(mongodb|rabbitmq|postgresql)$/ {print $1}')
   say "This deletes the volumes of the bundled services, so rollback stops working:"
@@ -1762,7 +1806,7 @@ cmd_migrate() {
   status=$(cm_value "$RELEASE-bundled-migration" status)
   ran_in=$(cm_value "$RELEASE-bundled-migration" workdir)
   case $status in
-    running) die "A migration of $RELEASE did not finish. From ${ran_in:-its folder}, run: bash migrate.sh rollback" ;;
+    running|rolling-back) die "A migration of $RELEASE did not finish. From ${ran_in:-its folder}, run: bash migrate.sh rollback" ;;
     migrated) die "Release $RELEASE is already migrated. From ${ran_in:-its folder}, use rollback or cleanup." ;;
     cleaned) die "Release $RELEASE is already migrated and cleaned up. Nothing to do." ;;
   esac
@@ -1793,6 +1837,16 @@ cmd_migrate() {
     ok "Plan only. Nothing was changed.${VALUES:+ The values it would use: $VALUES}"
     return 0
   fi
+  if ((KC_PROBE)); then
+    if keycloak_operator_serves; then
+      ok "A Keycloak operator serves namespace $NAMESPACE; it is used as it is"
+    else
+      [[ $INSTALL_OPERATORS == 1 ]] || die "No Keycloak operator serves namespace $NAMESPACE. Start one for it, or run without --no-install-operators."
+      note "No Keycloak operator serves namespace $NAMESPACE; one is installed there"
+      NEED_OPERATORS+=(keycloak)
+    fi
+  fi
+  save_context
   confirm
   trap on_exit EXIT
   trap 'exit 130' INT TERM
