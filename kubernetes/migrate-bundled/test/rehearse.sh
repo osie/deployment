@@ -215,9 +215,9 @@ cluster() {
   "$KIND" delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
   if [[ ${BUNDLED_HA:-0} == 1 ]]; then
     printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n- role: worker\n- role: worker\n- role: worker\n' >"$RUN/kind.yaml"
-    "$KIND" create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --config "$RUN/kind.yaml" --wait 180s
+    "$KIND" create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --config "$RUN/kind.yaml" ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} --wait 180s
   else
-    "$KIND" create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --wait 120s
+    "$KIND" create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} --wait 120s
   fi
   printf '%s\n' "${IMAGES[@]}" | xargs -P 8 -I{} sh -c 'docker image inspect {} >/dev/null 2>&1 || docker pull -q {} >/dev/null' || true
   local node
@@ -225,7 +225,7 @@ cluster() {
     printf '%s\n' "${IMAGES[@]}" | xargs -P 4 -I{} sh -c \
       "docker save {} | docker exec -i $node ctr -n k8s.io images import --platform linux/amd64 - >/dev/null 2>&1 || echo '  could not preload {} on $node'" || true
   done
-  h upgrade --install traefik traefik --repo https://traefik.github.io/charts -n traefik --create-namespace \
+  h upgrade --install traefik traefik --repo https://traefik.github.io/charts -n traefik --create-namespace ${TRAEFIK_CHART_VERSION:+--version "$TRAEFIK_CHART_VERSION"} \
     --set service.spec.type=ClusterIP --set ingressClass.isDefaultClass=true --wait --timeout 5m >/dev/null
   local ip corefile
   ip=$(kubectl -n traefik get svc traefik -o jsonpath='{.spec.clusterIP}')

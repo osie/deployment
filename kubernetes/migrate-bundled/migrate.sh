@@ -6,7 +6,9 @@ umask 077
 
 PSMDB_OPERATOR_VERSION=1.22.0
 RABBITMQ_OPERATOR_VERSION=v2.21.0
-CNPG_VERSION=1.30.2
+CNPG_VERSION=${CNPG_VERSION:-}
+CNPG_PICKED=0
+MIN_K8S_MINOR=27
 KEYCLOAK_OPERATOR_VERSION=26.8.2
 MIN_CHART_VERSION=26.8.0
 LAST_BUNDLED_CHART=26.8.2
@@ -801,8 +803,55 @@ plan_operator() {
   fi
 }
 
+server_minor() { kc version -o json 2>/dev/null | grep -A4 '"serverVersion"' | grep -o '"minor": *"[0-9]*' | grep -o '[0-9]*$'; }
+
+# Only the CustomResourceDefinitions of a multi-document manifest
+crds_only() {
+  awk '/^---/ { if (doc ~ /\nkind: CustomResourceDefinition/) printf "---%s\n", doc; doc = ""; next }
+       { doc = doc "\n" $0 }
+       END { if (doc ~ /\nkind: CustomResourceDefinition/) printf "---%s\n", doc }'
+}
+
+operator_crds() {
+  case $1 in
+    psmdb) hm template percona-mongodb-operator psmdb-operator --repo https://percona.github.io/percona-helm-charts \
+             --version "$PSMDB_OPERATOR_VERSION" -n percona-mongodb --include-crds | crds_only ;;
+    rabbitmq) curl -fsSL "https://github.com/rabbitmq/cluster-operator/releases/download/$RABBITMQ_OPERATOR_VERSION/cluster-operator.yml" | crds_only ;;
+    cnpg) curl -fsSL "https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v$CNPG_VERSION/cnpg-$CNPG_VERSION.yaml" | crds_only ;;
+    keycloak)
+      local crd
+      for crd in keycloaks keycloakrealmimports keycloakoidcclients keycloaksamlclients; do
+        printf -- '---\n'
+        curl -fsSL "https://raw.githubusercontent.com/keycloak/keycloak-k8s-resources/$KEYCLOAK_OPERATOR_VERSION/kubernetes/$crd.k8s.keycloak.org-v1.yml"
+      done ;;
+  esac
+}
+
+crds_accepted() {
+  local crds
+  crds=$(operator_crds "$1") && [[ -n $crds ]] || return 2
+  kc apply --server-side --dry-run=server --field-manager=osie-migrate -f - <<<"$crds" >/dev/null 2>"$WORKDIR/crds-$1.err"
+}
+
+# The newest CloudNativePG whose definitions this cluster accepts
+pick_cnpg_version() {
+  local v rc
+  for v in 1.30.2 1.29.1; do
+    CNPG_VERSION=$v
+    rc=0
+    crds_accepted cnpg || rc=$?
+    ((rc == 0)) && { CNPG_PICKED=1; return 0; }
+    ((rc == 2)) && die "Could not download CloudNativePG $v. The script installs operators from the internet; install them first and run with --no-install-operators."
+  done
+  die "This Kubernetes version refuses the definitions of CloudNativePG 1.30.2 and 1.29.1, so nothing was changed. Upgrade Kubernetes, then run again.
+$(tail -3 "$WORKDIR/crds-cnpg.err")"
+}
+
 check_operators() {
   NEED_OPERATORS=() REUSED_OPERATORS=() OPERATOR_LINES=()
+  if [[ -n $KC_WL && -z $CNPG_VERSION && $INSTALL_OPERATORS == 1 ]] && ! kc get crd clusters.postgresql.cnpg.io >/dev/null 2>&1; then
+    pick_cnpg_version
+  fi
   [[ -z $MONGO_WL ]] || plan_operator psmdb "Percona MongoDB" perconaservermongodbs.psmdb.percona.com \
     "$PSMDB_OPERATOR_VERSION in namespace percona-mongodb, watching all namespaces"
   [[ -z $RABBIT_WL ]] || plan_operator rabbitmq RabbitMQ rabbitmqclusters.rabbitmq.com \
@@ -823,6 +872,15 @@ check_operators() {
     out=$("${key}_manifest" | k apply --dry-run=server --validate=strict -f - 2>&1 >/dev/null) \
       || die "The cluster's $key CRD refuses what the script would create, so its operator is older than the script supports. Upgrade that operator, then run again.
 $out"
+  done
+  local rc
+  for key in "${NEED_OPERATORS[@]}"; do
+    [[ $key == cnpg && $CNPG_PICKED == 1 ]] && continue
+    rc=0
+    crds_accepted "$key" || rc=$?
+    ((rc != 2)) || die "Could not download the $key operator's manifests. The script installs operators from the internet; install them first and run with --no-install-operators."
+    ((rc == 0)) || die "This Kubernetes version refuses the CRDs of the $key operator the script would install, so nothing was changed. Upgrade Kubernetes, or install a $key operator that supports it and run again.
+$(tail -3 "$WORKDIR/crds-$key.err")"
   done
   return 0
 }
@@ -1801,6 +1859,10 @@ cmd_cleanup() {
 
 cmd_migrate() {
   detect_tools
+  local minor
+  minor=$(server_minor)
+  [[ -z $minor ]] || ((minor >= MIN_K8S_MINOR)) \
+    || die "The cluster runs Kubernetes 1.$minor. The operators this script installs need 1.$MIN_K8S_MINOR or later, so nothing was changed. Upgrade Kubernetes, then run again."
   find_release
   local status ran_in
   status=$(cm_value "$RELEASE-bundled-migration" status)
@@ -1821,7 +1883,7 @@ cmd_migrate() {
   save_context
   discover
   [[ $RELEASE_KIND == keycloak || -n $VALUES_FILE ]] \
-    || die "Pass --values <file>: the values file you deploy OSIE with. The migration's settings are merged into it. Without one, write it from what the release runs with: helm get values $RELEASE -n $NAMESPACE > values.yaml"
+    || die "Pass --values <file>: the values file you deploy OSIE with. The migration's settings are merged into it. Without one, write it from what the release runs with: helm get values $RELEASE -n $NAMESPACE -o yaml > values.yaml"
   if [[ $RELEASE_KIND == keycloak ]]; then
     check_keycloak_release
   else

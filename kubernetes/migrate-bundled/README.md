@@ -29,7 +29,7 @@ mkdir osie-migration && cd osie-migration
 curl -fsSLO https://raw.githubusercontent.com/osie/deployment/main/kubernetes/migrate-bundled/migrate.sh
 cp /path/to/your/values.yaml values.yaml
 #    No values file? Write one from what the release runs with:
-#    helm get values <release> -n <namespace> > values.yaml
+#    helm get values <release> -n <namespace> -o yaml > values.yaml
 
 # 3. What it would do, on which cluster. Nothing changes.
 bash migrate.sh plan --values values.yaml
@@ -66,6 +66,8 @@ You need:
 
 - bash 4.4 or later (on macOS, `brew install bash`), and cluster-admin rights through the same kubeconfig
   for `kubectl` and `helm` (helm 3.14 or later, or 4)
+- Kubernetes 1.27 or later. On 1.27 the script installs CloudNativePG 1.29.1, whose definitions that
+  version still accepts; on later versions, 1.30.2
 - the release on chart 26.8.0, 26.8.1 or 26.8.2, the last charts with the bundled services (see *When it
   stops before starting*)
 - room in the cluster for the new copies while the old volumes are kept: the new MongoDB has three members,
@@ -143,7 +145,9 @@ Applications that use this Keycloak need no change.
 
 | It says | What to do |
 |---|---|
-| Pass --values | Pass the values file you deploy OSIE with. Without one, write it from what the release runs with: `helm get values <release> -n <namespace> > values.yaml` |
+| Pass --values | Pass the values file you deploy OSIE with. Without one, write it from what the release runs with: `helm get values <release> -n <namespace> -o yaml > values.yaml` |
+| The cluster runs Kubernetes older than 1.27 | Upgrade Kubernetes first. The operators the script installs do not run on older versions |
+| This Kubernetes version refuses the CRDs of an operator | The operator the script would install does not support this Kubernetes version. Upgrade Kubernetes, or install a version of that operator that supports it and run again |
 | The release runs a chart older than 26.8.0 | Upgrade OSIE to chart 26.8.2 exactly, the last one with the bundled services, then run it again. Later charts refuse the upgrade. Without your values file at hand: `helm upgrade <release> osie --repo https://helm.osie.io --version 26.8.2 -n <namespace> --reset-then-reuse-values --wait`, adding `--server-side=false` with helm 4 so changes made with `kubectl edit` do not stop the upgrade halfway |
 | The release runs chart 26.8.3 or later | That chart deploys no bundled services, so there is nothing to move |
 | The cluster's CRD refuses what the script would create | The operator already installed is too old for it. Upgrade that operator, then run again |
