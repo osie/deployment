@@ -703,6 +703,7 @@ main() {
   tools
   if [[ -n $TARGET_CONTEXT ]]; then
     say "cluster $CTX, release $REL in $NS"
+    rm -rf "$RUN"/osie-migration-* "$RUN"/osie-plan-*
     if [[ $SCENARIO != existing && ${REUSE:-0} != 1 ]]; then
       if [[ $SCENARIO == standalone ]]; then install_standalone_keycloak; else install_osie; fi
     fi
